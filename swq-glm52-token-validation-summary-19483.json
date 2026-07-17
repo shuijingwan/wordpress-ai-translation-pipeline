@@ -1,0 +1,16 @@
+{
+    "post_id": 19483,
+    "expected_count": 507,
+    "actual_count": 506,
+    "expected_fixed_count": 498,
+    "actual_fixed_count": 498,
+    "fixed_order_valid": true,
+    "first_fixed_mismatch_position": 0,
+    "expected_fixed_at_mismatch": null,
+    "actual_fixed_at_mismatch": null,
+    "missing_tokens": [
+        "SWQINLINE000005END"
+    ],
+    "extra_tokens": [],
+    "duplicate_tokens": []
+}
