@@ -1,0 +1,521 @@
+diff --git a/sources/mu-plugins/swq-glm52-translation-tuning-production-2026-07-17.php b/archive/unreleased-token-namespace-2026.07.17.17/swq-glm52-translation-tuning-token-namespace.php
+index 1696fc8..104b51e 100644
+--- a/sources/mu-plugins/swq-glm52-translation-tuning-production-2026-07-17.php
++++ b/archive/unreleased-token-namespace-2026.07.17.17/swq-glm52-translation-tuning-token-namespace.php
+@@ -2,7 +2,7 @@
+ /**
+  * Plugin Name: SWQ GLM-5.2 Translation Tuning
+  * Description: Tunes GLM-5.2 requests and enables one-shot full-article translation for SlyTranslate with language-aware prompts, safe Plaintext translation, protected structures, and exact post-content persistence.
+- * Version: 2026.07.17.16
++ * Version: 2026.07.17.17
+  */
+ 
+ defined( 'ABSPATH' ) || exit;
+@@ -17,8 +17,9 @@ final class SWQ_GLM52_Translation_Tuning {
+ 	private const FULL_ARTICLE_RUNAWAY_OUTPUT_RATIO = 6.0;
+ 	private const TRACE_FILE = '/tmp/swq-glm52-execution-trace.jsonl';
+ 	private const PROMPT_POLICY_VERSION = '2026-07-16-v11';
+-	private const PROTECTED_TOKEN_REGEX = '/SWQ(?:BLOCK|INLINE|HTML|STRUCT|PLAINSTART|PLAINSTOP|ALTSTART|ALTSTOP)\d{6}END/';
+-	private const PROTECTED_TOKEN_LIKE_REGEX = '/SWQ(?:BLOCK|INLINE|HTML|STRUCT|PLAINSTART|PLAINSTOP|ALTSTART|ALTSTOP)\d+END/';
++	private const PROTECTED_TOKEN_TYPES = 'BLOCK|INLINE|HTML|STRUCT|PLAINSTART|PLAINSTOP|ALTSTART|ALTSTOP';
++	private const TOKEN_NAMESPACE_BYTES = 4;
++	private const TOKEN_NAMESPACE_ATTEMPTS = 16;
+ 
+ 	private static array $state = [
+ 		'active'          => false,
+@@ -27,6 +28,7 @@ final class SWQ_GLM52_Translation_Tuning {
+ 		'request_model'   => '',
+ 		'payload_chars'   => 0,
+ 		'protected_count' => 0,
++		'token_namespace' => '',
+ 		'max_tokens'      => 0,
+ 	];
+ 
+@@ -795,7 +797,17 @@ final class SWQ_GLM52_Translation_Tuning {
+ 		string $article_title,
+ 		string $article_excerpt
+ 	) {
+-		$protected = self::protect_content( $content );
++		$source_fields = [
++			'title'   => $article_title,
++			'excerpt' => $article_excerpt,
++			'content' => $content,
++		];
++		$token_namespace = self::generate_token_namespace( $source_fields );
++		if ( is_wp_error( $token_namespace ) ) {
++			return $token_namespace;
++		}
++
++		$protected = self::protect_content( $content, $token_namespace, 'content' );
+ 		if ( is_wp_error( $protected ) ) {
+ 			return $protected;
+ 		}
+@@ -816,7 +828,7 @@ final class SWQ_GLM52_Translation_Tuning {
+ 			$prompt_parts[] = "Article summary for context only:\n" . trim( $article_excerpt );
+ 		}
+ 
+-		$prompt_parts[] = self::build_content_prompt( $to );
++		$prompt_parts[] = self::build_content_prompt( $to, $token_namespace );
+ 
+ 		$full_prompt = implode( "\n\n", $prompt_parts );
+ 		self::$state = [
+@@ -826,6 +838,7 @@ final class SWQ_GLM52_Translation_Tuning {
+ 			'request_model'   => '',
+ 			'payload_chars'   => self::char_length( $payload ),
+ 			'protected_count' => count( $map ),
++			'token_namespace' => $token_namespace,
+ 			'max_tokens'      => 0,
+ 		];
+ 
+@@ -845,6 +858,7 @@ final class SWQ_GLM52_Translation_Tuning {
+ 				'protected_count' => count( $map ),
+ 				'target_language' => $to,
+ 				'prompt_policy'   => self::PROMPT_POLICY_VERSION,
++				'token_namespace' => $token_namespace,
+ 			]
+ 		);
+ 
+@@ -891,24 +905,26 @@ final class SWQ_GLM52_Translation_Tuning {
+ 		$raw_model_response = (string) $result;
+ 		$translated_payload = self::unwrap_model_output( $raw_model_response );
+ 
+-		preg_match_all( self::PROTECTED_TOKEN_REGEX, $payload, $source_token_matches );
++		preg_match_all( self::protected_token_regex( $token_namespace ), $payload, $source_token_matches );
+ 		$expected_tokens = isset( $source_token_matches[0] ) && is_array( $source_token_matches[0] )
+ 			? $source_token_matches[0]
+ 			: [];
+ 
+ 		// Repair only an unambiguous leading-zero contraction that passes the full strict validation.
+-		$translated_payload = self::normalize_unique_protected_tokens( $translated_payload, $expected_tokens );
++		$translated_payload = self::normalize_unique_protected_tokens( $translated_payload, $expected_tokens, $token_namespace );
+ 		$translated_payload = self::recover_uniquely_located_missing_token(
+ 			$translated_payload,
+ 			$payload,
+-			$expected_tokens
++			$expected_tokens,
++			$token_namespace
+ 		);
+ 		$token_validation   = self::validate_protected_tokens(
+ 			$translated_payload,
+ 			$expected_tokens,
+ 			$payload,
+ 			$map,
+-			$raw_model_response
++			$raw_model_response,
++			$token_namespace
+ 		);
+ 		if ( is_wp_error( $token_validation ) ) {
+ 			return $token_validation;
+@@ -930,7 +946,7 @@ final class SWQ_GLM52_Translation_Tuning {
+ 
+ 		$restored = str_replace( array_keys( $map ), array_values( $map ), $restored_regions );
+ 
+-		if ( preg_match( self::PROTECTED_TOKEN_REGEX, $restored ) ) {
++		if ( preg_match( self::protected_token_regex( $token_namespace ), $restored ) ) {
+ 			return new WP_Error( 'swq_full_article_restore_failed', 'One or more protected tokens remained after restoration.' );
+ 		}
+ 
+@@ -958,13 +974,146 @@ final class SWQ_GLM52_Translation_Tuning {
+ 		return $restored;
+ 	}
+ 
++	private static function generate_token_namespace( array $source_fields ) {
++		for ( $attempt = 1; $attempt <= self::TOKEN_NAMESPACE_ATTEMPTS; $attempt++ ) {
++			try {
++				$namespace = strtoupper( bin2hex( random_bytes( self::TOKEN_NAMESPACE_BYTES ) ) );
++			} catch ( Throwable $throwable ) {
++				return new WP_Error(
++					'swq_full_article_token_namespace_generation_failed',
++					'Could not securely generate a protected token namespace.'
++				);
++			}
+ 
+-	private static function protect_content( string $content ) {
+-		if ( preg_match( self::PROTECTED_TOKEN_REGEX, $content ) ) {
+-			return new WP_Error(
+-				'swq_full_article_token_collision',
+-				'The source content already contains a reserved protected token.'
++			$namespace = (string) apply_filters(
++				'swq_glm52_token_namespace_candidate',
++				$namespace,
++				$attempt,
++				$source_fields
+ 			);
++			$namespace = strtoupper( $namespace );
++			if ( 1 !== preg_match( '/^[A-F0-9]{8}$/D', $namespace ) ) {
++				continue;
++			}
++
++			if ( ! self::source_contains_token_namespace( $source_fields, $namespace ) ) {
++				return $namespace;
++			}
++		}
++
++		return new WP_Error(
++			'swq_full_article_token_namespace_exhausted',
++			sprintf(
++				'Could not find a collision-free protected token namespace after %d attempts.',
++				self::TOKEN_NAMESPACE_ATTEMPTS
++			)
++		);
++	}
++
++	private static function make_protected_token( string $namespace, string $type, int $index ): string {
++		return sprintf( 'SWQ%s%s%06dEND', $namespace, $type, $index );
++	}
++
++	private static function protected_token_regex( string $namespace, bool $token_like = false ): string {
++		$digits = $token_like ? '\\d+' : '\\d{6}';
++		return '/SWQ' . preg_quote( $namespace, '/' ) . '(?:' . self::PROTECTED_TOKEN_TYPES . ')' . $digits . 'END/';
++	}
++
++	private static function protected_token_parts( string $token, string $namespace, bool $token_like = false ): ?array {
++		$digits = $token_like ? '(\\d+)' : '(\\d{6})';
++		$pattern = '/^SWQ' . preg_quote( $namespace, '/' ) . '(' . self::PROTECTED_TOKEN_TYPES . ')' . $digits . 'END$/D';
++		if ( 1 !== preg_match( $pattern, $token, $matches ) ) {
++			return null;
++		}
++
++		return [ 'type' => $matches[1], 'number' => $matches[2] ];
++	}
++
++	private static function protected_token_type( string $token, string $namespace ): ?string {
++		$parts = self::protected_token_parts( $token, $namespace );
++		return null === $parts ? null : $parts['type'];
++	}
++
++	private static function source_contains_token_namespace( array $source_fields, string $namespace ): bool {
++		$needle = 'SWQ' . $namespace;
++		foreach ( $source_fields as $source ) {
++			if ( false !== strpos( (string) $source, $needle ) ) {
++				return true;
++			}
++		}
++
++		return false;
++	}
++
++	private static function find_token_collision( array $source_fields, string $namespace ): ?array {
++		$pattern = self::protected_token_regex( $namespace );
++		foreach ( $source_fields as $field => $source ) {
++			if ( 1 === preg_match( $pattern, (string) $source, $matches, PREG_OFFSET_CAPTURE ) ) {
++				$token  = (string) $matches[0][0];
++				$offset = (int) $matches[0][1];
++				return [
++					'collision_token'      => $token,
++					'collision_token_type' => self::protected_token_type( $token, $namespace ),
++					'collision_field'      => (string) $field,
++					'collision_offset'     => $offset,
++					'source_context'       => self::safe_source_context( (string) $source, $offset, strlen( $token ) ),
++					'collision_pattern'    => $pattern,
++				];
++			}
++		}
++
++		return null;
++	}
++
++	private static function safe_source_context( string $source, int $offset, int $token_length, int $radius = 180 ): string {
++		$start   = max( 0, $offset - $radius );
++		$context = substr( $source, $start, $token_length + ( 2 * $radius ) );
++		$patterns = [
++			'/(Authorization\\s*:\\s*)([^\\r\\n]+)/iu',
++			'/((?:api[_ -]?key|cookie|password)\\s*[:=]\\s*)([^\\s<>&"\']+)/iu',
++		];
++		$context = preg_replace( $patterns, '$1[REDACTED]', $context );
++		return is_string( $context ) ? $context : '[context unavailable]';
++	}
++
++	private static function token_collision_error( array $collision, string $namespace ): WP_Error {
++		$diagnostic_file = sprintf(
++			'/tmp/swq-glm52-token-collision-%d-%s.json',
++			(int) ( self::$state['post_id'] ?? 0 ),
++			$namespace
++		);
++		$data = $collision + [
++			'token_namespace' => $namespace,
++			'diagnostic_file' => $diagnostic_file,
++		];
++		$json = wp_json_encode( $data, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES | JSON_PRETTY_PRINT );
++		if ( is_string( $json ) ) {
++			@file_put_contents( $diagnostic_file, $json . "\n", LOCK_EX );
++			@chmod( $diagnostic_file, 0600 );
++		}
++
++		return new WP_Error(
++			'swq_full_article_token_collision',
++			sprintf(
++				'Protected token collision: token=%s, type=%s, field=%s, offset=%d, namespace=%s, pattern=%s, diagnostic_file=%s, source_context=%s',
++				$data['collision_token'],
++				$data['collision_token_type'] ?? 'unknown',
++				$data['collision_field'],
++				$data['collision_offset'],
++				$namespace,
++				$data['collision_pattern'],
++				$diagnostic_file,
++				$data['source_context']
++			),
++			$data
++		);
++	}
++
++
++	private static function protect_content( string $content, string $token_namespace, string $field = 'content' ) {
++		$collision = self::find_token_collision( [ $field => $content ], $token_namespace );
++		if ( null !== $collision ) {
++			return self::token_collision_error( $collision, $token_namespace );
+ 		}
+ 
+ 		$map            = [];
+@@ -977,30 +1126,30 @@ final class SWQ_GLM52_Translation_Tuning {
+ 		$plain_index    = 0;
+ 		$alt_index      = 0;
+ 
+-		$replace_block = static function ( array $matches ) use ( &$map, &$block_index ): string {
++		$replace_block = static function ( array $matches ) use ( &$map, &$block_index, $token_namespace ): string {
+ 			$block_index++;
+-			$token = sprintf( 'SWQBLOCK%06dEND', $block_index );
++			$token = self::make_protected_token( $token_namespace, 'BLOCK', $block_index );
+ 			$map[ $token ] = (string) $matches[0];
+ 			return $token;
+ 		};
+ 
+-		$replace_inline = static function ( array $matches ) use ( &$map, &$inline_index ): string {
++		$replace_inline = static function ( array $matches ) use ( &$map, &$inline_index, $token_namespace ): string {
+ 			$inline_index++;
+-			$token = sprintf( 'SWQINLINE%06dEND', $inline_index );
++			$token = self::make_protected_token( $token_namespace, 'INLINE', $inline_index );
+ 			$map[ $token ] = (string) $matches[0];
+ 			return $token;
+ 		};
+ 
+-		$replace_html = static function ( string $html ) use ( &$map, &$html_index ): string {
++		$replace_html = static function ( string $html ) use ( &$map, &$html_index, $token_namespace ): string {
+ 			$html_index++;
+-			$token = sprintf( 'SWQHTML%06dEND', $html_index );
++			$token = self::make_protected_token( $token_namespace, 'HTML', $html_index );
+ 			$map[ $token ] = $html;
+ 			return $token;
+ 		};
+ 
+-		$replace_structure = static function ( array $matches ) use ( &$map, &$struct_index ): string {
++		$replace_structure = static function ( array $matches ) use ( &$map, &$struct_index, $token_namespace ): string {
+ 			$struct_index++;
+-			$token = sprintf( 'SWQSTRUCT%06dEND', $struct_index );
++			$token = self::make_protected_token( $token_namespace, 'STRUCT', $struct_index );
+ 			$map[ $token ] = (string) $matches[0];
+ 			return $token;
+ 		};
+@@ -1010,10 +1159,10 @@ final class SWQ_GLM52_Translation_Tuning {
+ 			string $source_text,
+ 			string $type,
+ 			bool $preserve_source = false
+-		) use ( &$plain_regions, &$plain_index ): string {
++		) use ( &$plain_regions, &$plain_index, $token_namespace ): string {
+ 			$plain_index++;
+-			$start_token = sprintf( 'SWQPLAINSTART%06dEND', $plain_index );
+-			$stop_token  = sprintf( 'SWQPLAINSTOP%06dEND', $plain_index );
++			$start_token = self::make_protected_token( $token_namespace, 'PLAINSTART', $plain_index );
++			$stop_token  = self::make_protected_token( $token_namespace, 'PLAINSTOP', $plain_index );
+ 			$plain_regions[] = [
+ 				'start_token'     => $start_token,
+ 				'stop_token'      => $stop_token,
+@@ -1029,10 +1178,10 @@ final class SWQ_GLM52_Translation_Tuning {
+ 		$make_alt_region = static function (
+ 			string $original,
+ 			string $source_text
+-		) use ( &$alt_regions, &$alt_index ): string {
++		) use ( &$alt_regions, &$alt_index, $token_namespace ): string {
+ 			$alt_index++;
+-			$start_token = sprintf( 'SWQALTSTART%06dEND', $alt_index );
+-			$stop_token  = sprintf( 'SWQALTSTOP%06dEND', $alt_index );
++			$start_token = self::make_protected_token( $token_namespace, 'ALTSTART', $alt_index );
++			$stop_token  = self::make_protected_token( $token_namespace, 'ALTSTOP', $alt_index );
+ 			$alt_regions[] = [
+ 				'start_token' => $start_token,
+ 				'stop_token'  => $stop_token,
+@@ -1931,12 +2080,12 @@ final class SWQ_GLM52_Translation_Tuning {
+ 		@chmod( $output_file, 0600 );
+ 	}
+ 
+-	private static function normalize_unique_protected_tokens( string $translated, array $expected_tokens ): string {
+-		preg_match_all( self::PROTECTED_TOKEN_REGEX, $translated, $strict_matches );
++	private static function normalize_unique_protected_tokens( string $translated, array $expected_tokens, string $token_namespace ): string {
++		preg_match_all( self::protected_token_regex( $token_namespace ), $translated, $strict_matches );
+ 		$actual_tokens = isset( $strict_matches[0] ) && is_array( $strict_matches[0] ) ? $strict_matches[0] : [];
+ 		$missing_tokens = array_values( array_diff( $expected_tokens, $actual_tokens ) );
+ 
+-		preg_match_all( self::PROTECTED_TOKEN_LIKE_REGEX, $translated, $token_like_matches );
++		preg_match_all( self::protected_token_regex( $token_namespace, true ), $translated, $token_like_matches );
+ 		$token_like_tokens = isset( $token_like_matches[0] ) && is_array( $token_like_matches[0] )
+ 			? $token_like_matches[0]
+ 			: [];
+@@ -1945,37 +2094,30 @@ final class SWQ_GLM52_Translation_Tuning {
+ 		$claimed_expected  = [];
+ 
+ 		foreach ( $token_like_tokens as $token_like ) {
+-			if ( 1 === preg_match( '/^' . trim( self::PROTECTED_TOKEN_REGEX, '/' ) . '$/', $token_like ) ) {
++			if ( null !== self::protected_token_parts( $token_like, $token_namespace ) ) {
+ 				continue;
+ 			}
+ 
+ 			if ( 1 !== ( $token_like_counts[ $token_like ] ?? 0 )
+-				|| 1 !== preg_match(
+-					'/^SWQ(BLOCK|INLINE|HTML|STRUCT|PLAINSTART|PLAINSTOP|ALTSTART|ALTSTOP)(\d+)END$/',
+-					$token_like,
+-					$token_like_parts
+-				)
++				|| null === ( $token_like_parts = self::protected_token_parts( $token_like, $token_namespace, true ) )
+ 			) {
+ 				return $translated;
+ 			}
+ 
+-			$token_like_number = ltrim( (string) $token_like_parts[2], '0' );
++			$token_like_number = ltrim( (string) $token_like_parts['number'], '0' );
+ 			$token_like_number = '' === $token_like_number ? '0' : $token_like_number;
+ 			$candidates        = [];
+ 
+ 			foreach ( $missing_tokens as $missing_token ) {
+-				if ( 1 !== preg_match(
+-					'/^SWQ(BLOCK|INLINE|HTML|STRUCT|PLAINSTART|PLAINSTOP|ALTSTART|ALTSTOP)(\d{6})END$/',
+-					$missing_token,
+-					$expected_parts
+-				) ) {
++				$expected_parts = self::protected_token_parts( $missing_token, $token_namespace );
++				if ( null === $expected_parts ) {
+ 					continue;
+ 				}
+ 
+-				$expected_number = ltrim( (string) $expected_parts[2], '0' );
++				$expected_number = ltrim( (string) $expected_parts['number'], '0' );
+ 				$expected_number = '' === $expected_number ? '0' : $expected_number;
+ 
+-				if ( $token_like_parts[1] === $expected_parts[1] && $token_like_number === $expected_number ) {
++				if ( $token_like_parts['type'] === $expected_parts['type'] && $token_like_number === $expected_number ) {
+ 					$candidates[] = $missing_token;
+ 				}
+ 			}
+@@ -1993,13 +2135,13 @@ final class SWQ_GLM52_Translation_Tuning {
+ 		}
+ 
+ 		$normalized = strtr( $translated, $replacements );
+-		return self::protected_token_sequence_is_strictly_valid( $normalized, $expected_tokens )
++		return self::protected_token_sequence_is_strictly_valid( $normalized, $expected_tokens, $token_namespace )
+ 			? $normalized
+ 			: $translated;
+ 	}
+ 
+-	private static function protected_token_sequence_is_strictly_valid( string $translated, array $expected_tokens ): bool {
+-		preg_match_all( self::PROTECTED_TOKEN_REGEX, $translated, $matches );
++	private static function protected_token_sequence_is_strictly_valid( string $translated, array $expected_tokens, string $token_namespace ): bool {
++		preg_match_all( self::protected_token_regex( $token_namespace ), $translated, $matches );
+ 		$actual_tokens = isset( $matches[0] ) && is_array( $matches[0] ) ? $matches[0] : [];
+ 
+ 		if ( count( $expected_tokens ) !== count( $actual_tokens )
+@@ -2013,13 +2155,13 @@ final class SWQ_GLM52_Translation_Tuning {
+ 		$expected_fixed_tokens = array_values(
+ 			array_filter(
+ 				$expected_tokens,
+-				static fn ( string $token ): bool => ! str_starts_with( $token, 'SWQINLINE' )
++				static fn ( string $token ): bool => 'INLINE' !== self::protected_token_type( $token, $token_namespace )
+ 			)
+ 		);
+ 		$actual_fixed_tokens = array_values(
+ 			array_filter(
+ 				$actual_tokens,
+-				static fn ( string $token ): bool => ! str_starts_with( $token, 'SWQINLINE' )
++				static fn ( string $token ): bool => 'INLINE' !== self::protected_token_type( $token, $token_namespace )
+ 			)
+ 		);
+ 
+@@ -2029,9 +2171,10 @@ final class SWQ_GLM52_Translation_Tuning {
+ 	private static function recover_uniquely_located_missing_token(
+ 		string $translated,
+ 		string $source_payload,
+-		array $expected_tokens
++		array $expected_tokens,
++		string $token_namespace
+ 	): string {
+-		preg_match_all( self::PROTECTED_TOKEN_REGEX, $translated, $matches );
++		preg_match_all( self::protected_token_regex( $token_namespace ), $translated, $matches );
+ 		$actual_tokens  = isset( $matches[0] ) && is_array( $matches[0] ) ? $matches[0] : [];
+ 		$missing_tokens = array_values( array_diff( $expected_tokens, $actual_tokens ) );
+ 
+@@ -2090,7 +2233,7 @@ final class SWQ_GLM52_Translation_Tuning {
+ 
+ 		$recovered = preg_replace( $pattern, $replace, $translated, 1 );
+ 		return is_string( $recovered )
+-			&& self::protected_token_sequence_is_strictly_valid( $recovered, $expected_tokens )
++			&& self::protected_token_sequence_is_strictly_valid( $recovered, $expected_tokens, $token_namespace )
+ 			? $recovered
+ 			: $translated;
+ 	}
+@@ -2100,9 +2243,10 @@ final class SWQ_GLM52_Translation_Tuning {
+ 		array $expected_tokens,
+ 		string $source_payload,
+ 		array $protected_map,
+-		string $raw_model_response
++		string $raw_model_response,
++		string $token_namespace
+ 	) {
+-		preg_match_all( self::PROTECTED_TOKEN_REGEX, $translated, $matches );
++		preg_match_all( self::protected_token_regex( $token_namespace ), $translated, $matches );
+ 		$actual_tokens = isset( $matches[0] ) && is_array( $matches[0] ) ? $matches[0] : [];
+ 
+ 		$expected_count   = count( $expected_tokens );
+@@ -2121,14 +2265,14 @@ final class SWQ_GLM52_Translation_Tuning {
+ 		$expected_fixed_tokens = array_values(
+ 			array_filter(
+ 				$expected_tokens,
+-				static fn ( string $token ): bool => ! str_starts_with( $token, 'SWQINLINE' )
++				static fn ( string $token ): bool => 'INLINE' !== self::protected_token_type( $token, $token_namespace )
+ 			)
+ 		);
+ 
+ 		$actual_fixed_tokens = array_values(
+ 			array_filter(
+ 				$actual_tokens,
+-				static fn ( string $token ): bool => ! str_starts_with( $token, 'SWQINLINE' )
++				static fn ( string $token ): bool => 'INLINE' !== self::protected_token_type( $token, $token_namespace )
+ 			)
+ 		);
+ 
+@@ -2205,13 +2349,15 @@ final class SWQ_GLM52_Translation_Tuning {
+ 			'missing_token_details'            => array_map(
+ 				static fn ( string $token ): array => [
+ 					'token'             => $token,
+-					'type'              => preg_replace( '/^SWQ([A-Z]+)\\d{6}END$/', '$1', $token ),
++					'type'              => self::protected_token_type( $token, $token_namespace ),
+ 					'protected_content' => $protected_map[ $token ] ?? null,
+ 				],
+ 				array_slice( $missing_tokens, 0, 20 )
+ 			),
+ 			'source_context'                   => $source_context,
+ 			'response_context'                 => $response_context,
++			'token_namespace'                  => $token_namespace,
++			'collision_pattern'                => self::protected_token_regex( $token_namespace ),
+ 		];
+ 
+ 		$summary_file = '/tmp/swq-glm52-token-validation-summary.json';
+@@ -2333,10 +2479,10 @@ final class SWQ_GLM52_Translation_Tuning {
+ 		return implode( "\n\n", $prompt_parts );
+ 	}
+ 
+-	private static function build_content_prompt( string $target_language ): string {
++	private static function build_content_prompt( string $target_language, string $token_namespace ): string {
+ 		$language_rules = self::build_target_language_content_rules( $target_language );
+ 
+-		return "全文翻译模式：\n\n"
++		$prompt = "全文翻译模式：\n\n"
+ 			. "输入内容是一篇技术文章的完整正文。请将它作为一个连贯、可直接发布的完整文档翻译成目标语言。\n\n"
+ 			. "请根据文章内容判断其实际技术领域，不要预设每篇文章都与 WordPress、PHP、Nginx、服务器或任何其他固定技术有关。\n\n"
+ 			. $language_rules
+@@ -2374,6 +2520,8 @@ SWQSTRUCT 开头的占位符代表原始 Gutenberg 起始或结束区块注释
+ 
+ 不得添加解释、引言、结语、评论、免责声明、营销语言、Markdown 代码围栏或源文不存在的内容。最终只返回完整的英文译文正文。
+ PROMPT;
++
++		return str_replace( 'SWQ', 'SWQ' . $token_namespace, $prompt );
+ 	}
+ 
+ 	private static function build_target_language_field_rules( string $target_language, string $field ): string {
