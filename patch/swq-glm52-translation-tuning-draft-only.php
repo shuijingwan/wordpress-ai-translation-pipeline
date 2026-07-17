@@ -2,7 +2,7 @@
 /**
  * Plugin Name: SWQ GLM-5.2 Translation Tuning
  * Description: Tunes GLM-5.2 requests and enables one-shot full-article translation for SlyTranslate with language-aware prompts, safe Plaintext translation, protected structures, and exact post-content persistence.
- * Version: 2026.07.17.13
+ * Version: 2026.07.17.15
  */
 
 defined( 'ABSPATH' ) || exit;
@@ -18,6 +18,7 @@ final class SWQ_GLM52_Translation_Tuning {
 	private const TRACE_FILE = '/tmp/swq-glm52-execution-trace.jsonl';
 	private const PROMPT_POLICY_VERSION = '2026-07-16-v11';
 	private const PROTECTED_TOKEN_REGEX = '/SWQ(?:BLOCK|INLINE|HTML|STRUCT|PLAINSTART|PLAINSTOP|ALTSTART|ALTSTOP)\d{6}END/';
+	private const PROTECTED_TOKEN_LIKE_REGEX = '/SWQ(?:BLOCK|INLINE|HTML|STRUCT|PLAINSTART|PLAINSTOP|ALTSTART|ALTSTOP)\d+END/';
 
 	private static array $state = [
 		'active'          => false,
@@ -841,7 +842,9 @@ final class SWQ_GLM52_Translation_Tuning {
 			? $source_token_matches[0]
 			: [];
 
-		$token_validation = self::validate_protected_tokens( $translated_payload, $expected_tokens );
+		// Repair only an unambiguous leading-zero contraction that passes the full strict validation.
+		$translated_payload = self::normalize_unique_protected_tokens( $translated_payload, $expected_tokens );
+		$token_validation   = self::validate_protected_tokens( $translated_payload, $expected_tokens );
 		if ( is_wp_error( $token_validation ) ) {
 			return $token_validation;
 		}
@@ -1861,6 +1864,101 @@ final class SWQ_GLM52_Translation_Tuning {
 
 		@file_put_contents( $output_file, $translated, LOCK_EX );
 		@chmod( $output_file, 0600 );
+	}
+
+	private static function normalize_unique_protected_tokens( string $translated, array $expected_tokens ): string {
+		preg_match_all( self::PROTECTED_TOKEN_REGEX, $translated, $strict_matches );
+		$actual_tokens = isset( $strict_matches[0] ) && is_array( $strict_matches[0] ) ? $strict_matches[0] : [];
+		$missing_tokens = array_values( array_diff( $expected_tokens, $actual_tokens ) );
+
+		preg_match_all( self::PROTECTED_TOKEN_LIKE_REGEX, $translated, $token_like_matches );
+		$token_like_tokens = isset( $token_like_matches[0] ) && is_array( $token_like_matches[0] )
+			? $token_like_matches[0]
+			: [];
+		$token_like_counts = array_count_values( $token_like_tokens );
+		$replacements      = [];
+		$claimed_expected  = [];
+
+		foreach ( $token_like_tokens as $token_like ) {
+			if ( 1 === preg_match( '/^' . trim( self::PROTECTED_TOKEN_REGEX, '/' ) . '$/', $token_like ) ) {
+				continue;
+			}
+
+			if ( 1 !== ( $token_like_counts[ $token_like ] ?? 0 )
+				|| 1 !== preg_match(
+					'/^SWQ(BLOCK|INLINE|HTML|STRUCT|PLAINSTART|PLAINSTOP|ALTSTART|ALTSTOP)(\d+)END$/',
+					$token_like,
+					$token_like_parts
+				)
+			) {
+				return $translated;
+			}
+
+			$token_like_number = ltrim( (string) $token_like_parts[2], '0' );
+			$token_like_number = '' === $token_like_number ? '0' : $token_like_number;
+			$candidates        = [];
+
+			foreach ( $missing_tokens as $missing_token ) {
+				if ( 1 !== preg_match(
+					'/^SWQ(BLOCK|INLINE|HTML|STRUCT|PLAINSTART|PLAINSTOP|ALTSTART|ALTSTOP)(\d{6})END$/',
+					$missing_token,
+					$expected_parts
+				) ) {
+					continue;
+				}
+
+				$expected_number = ltrim( (string) $expected_parts[2], '0' );
+				$expected_number = '' === $expected_number ? '0' : $expected_number;
+
+				if ( $token_like_parts[1] === $expected_parts[1] && $token_like_number === $expected_number ) {
+					$candidates[] = $missing_token;
+				}
+			}
+
+			if ( 1 !== count( $candidates ) || isset( $claimed_expected[ $candidates[0] ] ) ) {
+				return $translated;
+			}
+
+			$replacements[ $token_like ]       = $candidates[0];
+			$claimed_expected[ $candidates[0] ] = true;
+		}
+
+		if ( [] === $replacements ) {
+			return $translated;
+		}
+
+		$normalized = strtr( $translated, $replacements );
+		return self::protected_token_sequence_is_strictly_valid( $normalized, $expected_tokens )
+			? $normalized
+			: $translated;
+	}
+
+	private static function protected_token_sequence_is_strictly_valid( string $translated, array $expected_tokens ): bool {
+		preg_match_all( self::PROTECTED_TOKEN_REGEX, $translated, $matches );
+		$actual_tokens = isset( $matches[0] ) && is_array( $matches[0] ) ? $matches[0] : [];
+
+		if ( count( $expected_tokens ) !== count( $actual_tokens )
+			|| [] !== array_diff( $expected_tokens, $actual_tokens )
+			|| [] !== array_diff( $actual_tokens, $expected_tokens )
+			|| count( $actual_tokens ) !== count( array_unique( $actual_tokens ) )
+		) {
+			return false;
+		}
+
+		$expected_fixed_tokens = array_values(
+			array_filter(
+				$expected_tokens,
+				static fn ( string $token ): bool => ! str_starts_with( $token, 'SWQINLINE' )
+			)
+		);
+		$actual_fixed_tokens = array_values(
+			array_filter(
+				$actual_tokens,
+				static fn ( string $token ): bool => ! str_starts_with( $token, 'SWQINLINE' )
+			)
+		);
+
+		return $expected_fixed_tokens === $actual_fixed_tokens;
 	}
 
 	private static function validate_protected_tokens( string $translated, array $expected_tokens ) {
