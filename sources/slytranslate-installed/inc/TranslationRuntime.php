@@ -1,0 +1,2591 @@
+<?php
+
+namespace SlyTranslate;
+
+defined( 'ABSPATH' ) || exit;
+
+/**
+ * Core translation engine: prompt building, chunked transport, context-window
+ * heuristics, retry logic, and diagnostics.
+ */
+class TranslationRuntime {
+
+	/* ---------------------------------------------------------------
+	 * Constants
+	 * ------------------------------------------------------------- */
+
+	private const DEFAULT_CONTEXT_WINDOW_TOKENS = 8192;
+	private const MIN_CONTEXT_WINDOW_TOKENS     = 2048;
+	private const MIN_TRANSLATION_CHARS         = 1200;
+	// Hard upper bound for chunk size in characters. Sized to let modern
+	// hosted LLMs (Groq, OpenAI, Anthropic, Gemini, Mistral, xAI, …) batch
+	// translations in far fewer requests so per-minute rate limits stop
+	// firing on longer pages, while still leaving enough context-window
+	// headroom for prompt overhead and the translated output. Local
+	// llama.cpp / ollama endpoints with smaller context windows remain
+	// naturally clamped by `get_chunk_char_limit_from_context_window()`
+	// (context_window_tokens * SAFE_CHARS_PER_CONTEXT_TOKEN) below this
+	// ceiling, so this bump does not affect them.
+	//
+	// The ceiling is deliberately high enough that for 128K+ context
+	// models, a whole medium post fits into a single request (fewer RPM
+	// hits on hosted providers like Groq). Output-side headroom is
+	// handled separately by `compute_max_output_tokens()` (capped at
+	// `MAX_OUTPUT_TOKENS_CEILING`), so raising this value without also
+	// raising the output ceiling would truncate the model response.
+	private const MAX_TRANSLATION_CHARS         = 48000;
+	private const SAFE_CHARS_PER_CONTEXT_TOKEN  = 0.5;
+	private const TIMEOUT_RETRY_MIN_CHARS       = 400;
+	// Upper bound for `max_tokens` / `max_output_tokens` per request.
+	// Scaled to MAX_TRANSLATION_CHARS so a chunk that fills the char
+	// ceiling can emit a full-size translation. Formula:
+	//   MAX_TRANSLATION_CHARS (48 000) × 0.5 tokens/char ≈ 24 000 input tokens
+	//   × 1.35 growth headroom                            ≈ 32 400 output tokens
+	// → rounded up to 32 768 (power of 2).
+	// Filter: `ai_translate_max_output_tokens_ceiling`.
+	private const MAX_OUTPUT_TOKENS_CEILING     = 32768;
+	private const MIN_OUTPUT_TOKENS             = 256;
+	private const REQUEST_MODE_SYSTEM_PLUS_USER = 'system_plus_user';
+	private const REQUEST_MODE_USER_ONLY        = 'user_only';
+	private const PROMPT_STYLE_GENERIC_TEMPLATE = 'generic_template';
+	private const PROMPT_STYLE_BILINGUAL_FRAME  = 'bilingual_frame';
+	private const OUTPUT_WRAPPER_OPEN           = '<slytranslate-output>';
+	private const OUTPUT_WRAPPER_CLOSE          = '</slytranslate-output>';
+	private const CHUNK_STRATEGY_DEFAULT        = 'default';
+	private const CHUNK_STRATEGY_TOWER          = 'tower_conservative';
+	private const KNOWN_MODEL_CONTEXT_WINDOWS   = array(
+		// ── Anthropic Claude ──────────────────────────────────────────────
+		// All current Claude models (3.x, 3.5, 3.7, 4.x) share 200 K context.
+		'claude'          => 200000,
+
+		// ── Google Gemini ─────────────────────────────────────────────────
+		'gemini-2.5'      => 1000000,
+		'gemini-2.0'      => 1000000,
+		'gemini-1.5'      => 1000000,
+
+		// ── OpenAI GPT ────────────────────────────────────────────────────
+		// GPT-5 family (gpt-5, gpt-5.x) – context TBD, 200 K assumed.
+		'gpt-5'           => 200000,
+		'gpt-4.5'         => 128000,
+		// GPT-4.1 / 4.1-mini / 4.1-nano ship with a 1 M (1 047 576) context.
+		'gpt-4.1'         => 1048576,
+		// gpt-4o-mini must precede gpt-4o so it is matched first.
+		'gpt-4o-mini'     => 128000,
+		'gpt-4o'          => 128000,
+		'gpt-4-turbo'     => 128000,
+		'gpt-3.5-turbo'   => 16385,
+
+		// ── OpenAI reasoning models (200 K context) ───────────────────────
+		// List specific variants before their generic prefixes.
+		'o4-mini'         => 200000,
+		'o3-mini'         => 200000,
+		'o3'              => 200000,
+		'o1-mini'         => 128000,
+		'o1'              => 200000,
+
+		// ── xAI Grok ──────────────────────────────────────────────────────
+		'grok'            => 131072,
+
+		// ── Mistral AI / Ministral ──────────────────────────────────────────
+		// Ministral must precede mistral to avoid the broader `mistral` key
+		// matching first.
+		'ministral-3'     => 131072,  // Ministral 3B (2024): 128 K context.
+		'ministral'       => 131072,  // Ministral 8B (2024): 128 K context.
+		'codestral'       => 32768,
+		'pixtral'         => 128000,
+		'mistral-nemo'    => 131072,
+		'mistral-large'   => 131072,  // Mistral Large 2 (2024): 128 K context.
+		'mistral-small'   => 32768,
+
+		// ── Perplexity Sonar ──────────────────────────────────────────────
+		'sonar'           => 32768,
+
+		// ── Meta Llama ────────────────────────────────────────────────────
+		// Substring-based matching covers provider-prefixed slugs such as
+		// `meta-llama/Llama-3.3-70b` or `llama-3.3-70b-versatile`.
+		'llama-4'         => 131072,
+		'llama-3.3'       => 131072,
+		'llama-3.2'       => 131072,
+		'llama-3.1'       => 131072,
+		'llama-3'         => 8192,
+
+		// ── Mistral Mixtral ───────────────────────────────────────────────
+		'mixtral'         => 32768,
+
+		// ── Alibaba Qwen ──────────────────────────────────────────────────
+		// Both `qwen2.5` and `qwen-2.5` appear in practice.
+		'qwen3'           => 131072,
+		'qwen2.5'         => 131072,
+		'qwen-2.5'        => 131072,
+		'qwen'            => 32768,
+
+		// ── DeepSeek ──────────────────────────────────────────────────────
+		'deepseek'        => 131072,
+
+		// ── IBM Granite ──────────────────────────────────────────────────
+		// Granite 4.1 (reasoning/thinking model): 128 K context.
+		'granite-4.1'     => 131072,
+		'granite-4'       => 131072,
+		'granite-3'       => 131072,
+		'granite'         => 131072,
+
+		// ── Microsoft Phi ─────────────────────────────────────────────────
+		// More specific variants must precede the generic `phi` entry.
+		'phi-4-mini'      => 131072,
+		'phi-4'           => 16384,
+		'phi-3.5'         => 131072,
+		'phi-3'           => 131072,
+		'phi'             => 16384,
+
+		// ── Zhipu GLM (GLM-4, GLM-Z1, …) ────────────────────────────────
+		'glm'             => 131072,
+
+		// ── Moonshot / Kimi ───────────────────────────────────────────────
+		'moonshot'        => 131072,
+		'kimi'            => 131072,
+
+		// ── 01.AI Yi ──────────────────────────────────────────────────────
+		'yi'              => 200000,
+
+		// ── Shanghai AI Lab InternLM ──────────────────────────────────────
+		'internlm'        => 1000000,
+
+		// ── Cohere Command ────────────────────────────────────────────────
+		// command-r must precede the generic command entry.
+		'command-r'       => 128000,
+		'command'         => 128000,
+
+		// ── Nous Hermes (popular community fine-tunes) ────────────────────
+		'hermes'          => 131072,
+
+		// ── Unbabel TowerInstruct ─────────────────────────────────────────
+		'towerinstruct'   => 4096,
+
+		// ── Falcon (TII) ─────────────────────────────────────────────────
+		'falcon'          => 8192,
+
+		// ── Baichuan ─────────────────────────────────────────────────────
+		'baichuan'        => 131072,
+
+		// ── Google Gemma ─────────────────────────────────────────────────
+		// translategemma must precede the generic gemma entries.
+		'translategemma'  => 8192,
+		'gemma-4'         => 131072,
+		'gemma-3'         => 131072,
+		'gemma'           => 8192,
+	);
+
+	/* ---------------------------------------------------------------
+	 * Per-request state
+	 * ------------------------------------------------------------- */
+
+	/** Cached runtime context (model slug, direct API URL). */
+	private static $context = null;
+
+	/** Cached chunk char limit for the duration of one PHP request. */
+	private static ?int $chunk_char_limit_cache = null;
+
+	/** Per-request model slug override set by with_model_slug_override(). */
+	private static $model_slug_override = null;
+
+	/** Cached normalized model profiles keyed by lower-cased model slug. */
+	private static array $model_profile_cache = array();
+
+	/** Per-request cache for model slugs that reject chat_template_kwargs. */
+	private static array $wp_ai_client_kwargs_support_cache = array();
+
+	/** Source / target language codes set inside translate_text() for use by DirectApiTranslationClient. */
+	private static $source_lang = null;
+	private static $target_lang = null;
+
+	/** Diagnostics from the most recent chunk transport call. */
+	private static $last_diagnostics = null;
+
+	/** When true, TranslationValidator skips the HTML tag count and URL count checks. */
+	private static $skip_html_tag_validation = false;
+
+	/** Recursion guard for rate-limit (HTTP 429) retries inside a single chunk call. */
+	private static int $rate_limit_retry_depth = 0;
+	private const RATE_LIMIT_MAX_RETRIES   = 3;
+	private const RATE_LIMIT_MAX_SLEEP_SEC = 30;
+	private const RATE_LIMIT_MIN_SLEEP_SEC = 1;
+
+	/* ---------------------------------------------------------------
+	 * HTML tag validation bypass (used by ContentTranslator)
+	 * ------------------------------------------------------------- */
+
+	public static function set_skip_html_tag_validation( bool $skip ): void {
+		self::$skip_html_tag_validation = $skip;
+	}
+
+	public static function should_skip_html_tag_validation(): bool {
+		return self::$skip_html_tag_validation;
+	}
+
+	/* ---------------------------------------------------------------
+	 * Prompt building
+	 * ------------------------------------------------------------- */
+
+	public static function build_prompt( string $to, string $from = 'en', string $additional_prompt = '' ): string {
+		$template    = get_option( 'slytranslate_prompt', AI_Translate::get_default_prompt() );
+		$base_prompt = str_replace(
+			array( '{FROM_CODE}', '{TO_CODE}' ),
+			array( $from, $to ),
+			$template
+		);
+
+		$parts = array( $base_prompt );
+
+		$global_addon = get_option( 'slytranslate_prompt_addon', '' );
+		if ( is_string( $global_addon ) && '' !== trim( $global_addon ) ) {
+			$parts[] = trim( $global_addon );
+		}
+
+		if ( is_string( $additional_prompt ) && '' !== trim( $additional_prompt ) ) {
+			$parts[] = 'Additional style instructions (do NOT translate these lines, apply them to the user-provided content): ' . trim( $additional_prompt );
+		}
+
+		return implode( "\n\n", $parts );
+	}
+
+	/* ---------------------------------------------------------------
+	 * Model slug override (per-ability-call scope)
+	 * ------------------------------------------------------------- */
+
+	public static function normalize_requested_model_slug( $model_slug ): string {
+		if ( ! is_string( $model_slug ) ) {
+			return '';
+		}
+
+		$normalized = trim( sanitize_text_field( $model_slug ) );
+		if ( '' === $normalized ) {
+			return '';
+		}
+
+		if ( 1 === preg_match( '/^openrouter\s+(.+)$/i', $normalized, $matches )
+			&& is_string( $matches[1] )
+			&& false !== strpos( $matches[1], '/' )
+		) {
+			return trim( $matches[1] );
+		}
+
+		if ( 1 === preg_match( '/^[^:]+:\s+(.+)$/', $normalized, $matches )
+			&& is_string( $matches[1] )
+			&& false !== strpos( $matches[1], '/' )
+		) {
+			return trim( $matches[1] );
+		}
+
+		return $normalized;
+	}
+
+	public static function with_model_slug_override( $input, callable $callback ): mixed {
+		$previous                    = self::$model_slug_override;
+		$previous_context            = self::$context;
+		self::$model_slug_override   = is_array( $input )
+			&& isset( $input['model_slug'] )
+			&& is_string( $input['model_slug'] )
+			&& '' !== $input['model_slug']
+				? self::normalize_requested_model_slug( $input['model_slug'] )
+				: null;
+		self::$context = null;
+
+		// Chunk limit depends on model slug (context-window lookup).
+		// Clear the cache so the new model gets the correct limit.
+		self::$chunk_char_limit_cache = null;
+		self::$model_profile_cache    = array();
+		self::$wp_ai_client_kwargs_support_cache = array();
+
+		try {
+			return $callback();
+		} finally {
+			self::$model_slug_override    = $previous;
+			self::$context                = $previous_context;
+			self::$chunk_char_limit_cache = null;
+			self::$model_profile_cache    = array();
+			self::$wp_ai_client_kwargs_support_cache = array();
+		}
+	}
+
+	/* ---------------------------------------------------------------
+	 * Main entry point
+	 * ------------------------------------------------------------- */
+
+	/**
+	 * Translate text using the WordPress AI Client (or direct API).
+	 *
+	 * @return string|\WP_Error
+	 */
+	public static function translate_text( $text, string $to, string $from = 'en', string $additional_prompt = '' ): string|\WP_Error {
+		if ( ! $text || trim( $text ) === '' ) {
+			return '';
+		}
+
+		self::$source_lang    = $from;
+		self::$target_lang    = $to;
+		self::$last_diagnostics = null;
+
+		try {
+			$prompt = self::build_prompt( $to, $from, $additional_prompt );
+			return self::translate_with_chunk_limit( $text, $prompt, self::get_chunk_char_limit() );
+		} finally {
+			self::$source_lang    = null;
+			self::$target_lang    = null;
+			self::$last_diagnostics = null;
+		}
+	}
+
+	public static function translate_text_raw( $text, string $to, string $from = 'en', string $additional_prompt = '' ): string|\WP_Error {
+		if ( ! $text || trim( $text ) === '' ) {
+			return '';
+		}
+
+		self::$source_lang      = $from;
+		self::$target_lang      = $to;
+		self::$last_diagnostics = null;
+
+		try {
+			$prompt = self::build_prompt( $to, $from, $additional_prompt );
+			return self::translate_chunk( $text, $prompt, 0, true );
+		} finally {
+			self::$source_lang      = null;
+			self::$target_lang      = null;
+			self::$last_diagnostics = null;
+		}
+	}
+
+	/* ---------------------------------------------------------------
+	 * Chunked translation
+	 * ------------------------------------------------------------- */
+
+	public static function translate_with_chunk_limit(
+		string $text,
+		string $prompt,
+		int $chunk_char_limit,
+		int $attempt = 0,
+		bool $track_progress = true
+	): string|\WP_Error {
+		$chunks = TextSplitter::split_text_for_translation( $text, $chunk_char_limit );
+
+		if ( empty( $chunks ) ) {
+			return '';
+		}
+
+		$translated_chunks = array();
+
+		foreach ( $chunks as $chunk ) {
+			if ( TranslationProgressTracker::is_cancelled() ) {
+				return new \WP_Error( 'translation_cancelled', 'Translation cancelled.' );
+			}
+
+			$translated_chunk = self::translate_chunk( $chunk, $prompt );
+
+			if ( is_wp_error( $translated_chunk ) ) {
+				$adjusted = self::maybe_adjust_chunk_limit_from_error( $translated_chunk, $chunk_char_limit );
+				if ( $adjusted > 0 && $attempt < 2 ) {
+					// Re-attempt with smaller chunk size; do NOT roll back the
+					// already-credited progress because the upcoming retry
+					// will re-translate the same source text and credit it
+					// again \u2014 capping at the phase budget keeps the bar
+					// monotonic regardless.
+					return self::translate_with_chunk_limit( $text, $prompt, $adjusted, $attempt + 1, $track_progress );
+				}
+				return $translated_chunk;
+			}
+
+			$translated_chunks[] = $translated_chunk;
+
+			if ( $track_progress ) {
+				$chunk_units = self::char_length( $chunk );
+				if ( $chunk_units > 0 ) {
+					$active_phase = TranslationProgressTracker::current_phase();
+					if ( '' !== $active_phase && 'saving' !== $active_phase && 'done' !== $active_phase ) {
+						TranslationProgressTracker::advance_units( $active_phase, $chunk_units );
+					}
+				}
+			}
+		}
+
+		return implode( '', $translated_chunks );
+	}
+
+	private static function char_length( string $text ): int {
+		if ( function_exists( 'mb_strlen' ) ) {
+			return (int) mb_strlen( $text, 'UTF-8' );
+		}
+		return strlen( $text );
+	}
+
+	/**
+	 * Return a single-line, length-bounded excerpt of $text suitable for
+	 * inclusion in error_log lines. Used by validation diagnostics so we
+	 * can see what the model actually produced when something fails.
+	 */
+	private static function truncate_for_log( string $text, int $max = 240 ): string {
+		$text = preg_replace( '/\s+/u', ' ', $text ) ?? $text;
+		$text = trim( (string) $text );
+		if ( function_exists( 'mb_strlen' ) ) {
+			if ( mb_strlen( $text, 'UTF-8' ) > $max ) {
+				$text = mb_substr( $text, 0, $max, 'UTF-8' ) . '…';
+			}
+		} elseif ( strlen( $text ) > $max ) {
+			$text = substr( $text, 0, $max ) . '…';
+		}
+		return $text;
+	}
+
+	private static function get_default_model_profile(): array {
+		return array(
+			'id'                         => 'default',
+			'matchers'                   => array(),
+			'request_mode'               => self::REQUEST_MODE_USER_ONLY,
+			'prompt_style'               => self::PROMPT_STYLE_BILINGUAL_FRAME,
+			'supports_system_role'       => false,
+			'supports_chat_completions'  => true,
+			'requires_strict_direct_api' => false,
+			'requires_chat_template_kwargs' => false,
+			'extra_request_body'         => array(
+				'chat_template_kwargs' => array(
+					'enable_thinking' => false,
+				),
+			),
+			'chunk_strategy'             => self::CHUNK_STRATEGY_DEFAULT,
+			'max_chunk_chars'            => 0,
+			'string_table_batch_char_limit' => 0,
+			'temperature'                => 0,
+			'retry_profile'              => array(
+				'retry_on_validation_failure' => true,
+				'retry_on_passthrough_de'     => true,
+				'reduce_chunk_on_retry'       => true,
+				'retry_chunk_chars'           => 1800,
+			),
+		);
+	}
+
+	private static function normalize_model_profile( array $profile, array $defaults ): array {
+		$retry_defaults = is_array( $defaults['retry_profile'] ?? null ) ? $defaults['retry_profile'] : array();
+		$retry_profile  = is_array( $profile['retry_profile'] ?? null )
+			? array_merge( $retry_defaults, $profile['retry_profile'] )
+			: $retry_defaults;
+
+		$normalized = array_merge( $defaults, $profile );
+		$normalized['retry_profile'] = $retry_profile;
+
+		if ( ! is_array( $normalized['matchers'] ) ) {
+			if ( is_string( $normalized['matchers'] ) && '' !== trim( $normalized['matchers'] ) ) {
+				$normalized['matchers'] = array( trim( $normalized['matchers'] ) );
+			} else {
+				$normalized['matchers'] = array();
+			}
+		}
+
+		if ( ! in_array( $normalized['request_mode'], array( self::REQUEST_MODE_SYSTEM_PLUS_USER, self::REQUEST_MODE_USER_ONLY ), true ) ) {
+			$normalized['request_mode'] = (string) $defaults['request_mode'];
+		}
+
+		if ( ! in_array( $normalized['prompt_style'], array( self::PROMPT_STYLE_GENERIC_TEMPLATE, self::PROMPT_STYLE_BILINGUAL_FRAME ), true ) ) {
+			$normalized['prompt_style'] = (string) $defaults['prompt_style'];
+		}
+
+		if ( ! in_array( $normalized['chunk_strategy'], array( self::CHUNK_STRATEGY_DEFAULT, self::CHUNK_STRATEGY_TOWER ), true ) ) {
+			$normalized['chunk_strategy'] = self::CHUNK_STRATEGY_DEFAULT;
+		}
+
+		$normalized['supports_system_role']       = ! empty( $normalized['supports_system_role'] );
+		$normalized['supports_chat_completions']  = ! empty( $normalized['supports_chat_completions'] );
+		$normalized['requires_strict_direct_api'] = ! empty( $normalized['requires_strict_direct_api'] );
+		$normalized['requires_chat_template_kwargs'] = ! empty( $normalized['requires_chat_template_kwargs'] );
+		$normalized['max_chunk_chars']            = absint( $normalized['max_chunk_chars'] ?? 0 );
+		$normalized['string_table_batch_char_limit'] = absint( $normalized['string_table_batch_char_limit'] ?? 0 );
+		$temperature                              = is_numeric( $normalized['temperature'] ?? null ) ? (float) $normalized['temperature'] : 0.0;
+		$normalized['temperature']                = max( 0.0, min( 2.0, $temperature ) );
+
+		if ( ! is_array( $normalized['extra_request_body'] ) ) {
+			$normalized['extra_request_body'] = array();
+		}
+
+		$normalized['retry_profile']['retry_on_validation_failure'] = ! empty( $normalized['retry_profile']['retry_on_validation_failure'] );
+		$normalized['retry_profile']['retry_on_passthrough_de']     = ! empty( $normalized['retry_profile']['retry_on_passthrough_de'] );
+		$normalized['retry_profile']['reduce_chunk_on_retry']       = ! empty( $normalized['retry_profile']['reduce_chunk_on_retry'] );
+		$normalized['retry_profile']['retry_chunk_chars']           = absint( $normalized['retry_profile']['retry_chunk_chars'] ?? 0 );
+
+		$normalized['id'] = is_string( $normalized['id'] ?? null ) && '' !== trim( $normalized['id'] )
+			? sanitize_key( $normalized['id'] )
+			: 'default';
+
+		return $normalized;
+	}
+
+	private static function model_slug_matches_profile( string $model_slug, array $model_profile ): bool {
+		$matchers = $model_profile['matchers'] ?? array();
+		if ( ! is_array( $matchers ) ) {
+			return false;
+		}
+
+		foreach ( $matchers as $matcher ) {
+			if ( ! is_string( $matcher ) || '' === trim( $matcher ) ) {
+				continue;
+			}
+
+			if ( false !== strpos( $model_slug, strtolower( trim( $matcher ) ) ) ) {
+				return true;
+			}
+		}
+
+		return false;
+	}
+
+	public static function get_model_profile( string $model_slug ): array {
+		$normalized_slug = strtolower( trim( $model_slug ) );
+		if ( isset( self::$model_profile_cache[ $normalized_slug ] ) ) {
+			return self::$model_profile_cache[ $normalized_slug ];
+		}
+
+		$default_profile = self::get_default_model_profile();
+		$resolved        = $default_profile;
+
+		$profiles = AI_Translate::get_model_profiles();
+		if ( is_array( $profiles ) && '' !== $normalized_slug ) {
+			foreach ( $profiles as $profile_key => $candidate ) {
+				if ( ! is_array( $candidate ) ) {
+					continue;
+				}
+
+				if ( ! isset( $candidate['id'] ) && is_string( $profile_key ) && '' !== trim( $profile_key ) ) {
+					$candidate['id'] = $profile_key;
+				}
+
+				$normalized_candidate = self::normalize_model_profile( $candidate, $default_profile );
+				if ( self::model_slug_matches_profile( $normalized_slug, $normalized_candidate ) ) {
+					$resolved = $normalized_candidate;
+					break;
+				}
+			}
+		}
+
+		$resolved = self::normalize_model_profile( $resolved, $default_profile );
+		self::$model_profile_cache[ $normalized_slug ] = $resolved;
+
+		return $resolved;
+	}
+
+	public static function is_tower_model( string $model_slug ): bool {
+		return self::CHUNK_STRATEGY_TOWER === self::get_chunk_strategy_for_model( $model_slug );
+	}
+
+	public static function get_chunk_strategy_for_model( string $model_slug ): string {
+		$profile = self::get_model_profile( $model_slug );
+		return (string) ( $profile['chunk_strategy'] ?? self::CHUNK_STRATEGY_DEFAULT );
+	}
+
+	public static function get_prompt_style_for_model( string $model_slug ): string {
+		$profile = self::get_model_profile( $model_slug );
+		return (string) ( $profile['prompt_style'] ?? self::PROMPT_STYLE_GENERIC_TEMPLATE );
+	}
+
+	private static function resolve_language_label( ?string $language_code, string $fallback ): string {
+		$normalized = strtolower( trim( (string) $language_code ) );
+		if ( '' === $normalized ) {
+			return $fallback;
+		}
+
+		$normalized = str_replace( '_', '-', $normalized );
+		$normalized = preg_replace( '/[^a-z0-9-]+/i', '', $normalized );
+		if ( ! is_string( $normalized ) ) {
+			return $fallback;
+		}
+
+		$normalized = trim( $normalized, '-' );
+
+		return '' !== $normalized ? strtoupper( $normalized ) : $fallback;
+	}
+
+	private static function build_bilingual_frame_prompt( string $text, string $prompt, int $validation_attempt ): string {
+		$source_label = self::resolve_language_label( is_string( self::$source_lang ) ? self::$source_lang : null, 'Source' );
+		$target_label = self::resolve_language_label( is_string( self::$target_lang ) ? self::$target_lang : null, 'Target' );
+
+		$parts   = array();
+		$parts[] = sprintf( 'Translate the following text from %1$s into %2$s.', $source_label, $target_label );
+		$parts[] = sprintf( 'CRITICAL OUTPUT FORMAT: Return only the translation enclosed in %1$s and %2$s. Do not output anything before or after these tags.', self::OUTPUT_WRAPPER_OPEN, self::OUTPUT_WRAPPER_CLOSE );
+		if ( '' !== trim( $prompt ) ) {
+			$parts[] = 'MANDATORY TRANSLATION RULES (obey exactly): ' . trim( $prompt );
+			$parts[] = 'CRITICAL: Apply every translation rule above exactly.';
+		}
+		if ( $validation_attempt > 0 ) {
+			$parts[] = sprintf( 'CRITICAL: Return only %s. Do not copy sentences in %s.', $target_label, $source_label );
+		}
+		$parts[] = $source_label . ':';
+		$parts[] = $text;
+		$parts[] = $target_label . ':';
+
+		return implode( "\n\n", $parts );
+	}
+
+	private static function replace_profile_placeholders( mixed $value ): mixed {
+		if ( is_array( $value ) ) {
+			$result = array();
+			foreach ( $value as $key => $inner_value ) {
+				$result[ $key ] = self::replace_profile_placeholders( $inner_value );
+			}
+			return $result;
+		}
+
+		if ( ! is_string( $value ) ) {
+			return $value;
+		}
+
+		$source_lang_code = is_string( self::$source_lang ) ? self::$source_lang : '';
+		$target_lang_code = is_string( self::$target_lang ) ? self::$target_lang : '';
+
+		return str_replace(
+			array( '{source_lang_code}', '{target_lang_code}' ),
+			array( $source_lang_code, $target_lang_code ),
+			$value
+		);
+	}
+
+	private static function is_openrouter_nemotron_model_slug( string $model_slug ): bool {
+		$normalized = strtolower( trim( $model_slug ) );
+
+		return '' !== $normalized
+			&& (
+				false !== strpos( $normalized, 'nvidia/nemotron-3-nano' )
+				|| false !== strpos( $normalized, 'nvidia/nemotron-3-super' )
+			);
+	}
+
+	private static function apply_model_specific_extra_request_body_overrides( array $extra, string $model_slug ): array {
+		if ( ! self::is_openrouter_nemotron_model_slug( $model_slug ) ) {
+			return $extra;
+		}
+
+		foreach (
+			array(
+				'reasoning' => array(
+					'effort'  => 'none',
+					// phpcs:ignore WordPressVIPMinimum.Performance.WPQueryParams.PostNotIn_exclude -- External API payload uses "exclude" as a reasoning flag, not as a WP_Query parameter.
+					'exclude' => true,
+				),
+				'provider'  => array(
+					'require_parameters' => true,
+				),
+			) as $key => $value
+		) {
+			if ( isset( $extra[ $key ] ) && is_array( $extra[ $key ] ) ) {
+				$extra[ $key ] = array_merge( $extra[ $key ], $value );
+				continue;
+			}
+
+			$extra[ $key ] = $value;
+		}
+
+		return $extra;
+	}
+
+	/**
+	 * Extract chat_template_kwargs (and other safe-to-inject keys) from the
+	 * model profile that should be merged into outgoing WordPress AI Client
+	 * HTTP requests. Unlike build_profile_extra_request_body() this is not
+	 * gated on the direct-API kwargs probe because the WP AI Client connector
+	 * targets its own configured endpoint and does not need direct probing.
+	 *
+	 * Only a small allowlist is forwarded so profile-level request shaping
+	 * cannot overwrite core transport keys like `messages` or `model`.
+	 *
+	 * @param array $model_profile Normalized model profile.
+	 * @return array Subset of extra_request_body to inject; empty array when nothing applies.
+	 */
+	public static function extract_wp_ai_client_request_body_injections( array $model_profile, bool $allow_chat_template_kwargs = true, string $model_slug = '' ): array {
+		$extra = $model_profile['extra_request_body'] ?? array();
+		if ( ! is_array( $extra ) || empty( $extra ) ) {
+			return array();
+		}
+
+		$extra = self::replace_profile_placeholders( $extra );
+		$extra = self::apply_model_specific_extra_request_body_overrides( $extra, $model_slug );
+
+		$inject = array();
+		if ( self::should_disable_chat_template_kwargs_for_model( $model_slug ) ) {
+			$allow_chat_template_kwargs = false;
+		}
+
+		if ( $allow_chat_template_kwargs
+			&& isset( $extra['chat_template_kwargs'] )
+			&& is_array( $extra['chat_template_kwargs'] )
+			&& ! empty( $extra['chat_template_kwargs'] )
+		) {
+			$inject['chat_template_kwargs'] = $extra['chat_template_kwargs'];
+		}
+
+		foreach ( array( 'reasoning', 'provider' ) as $safe_key ) {
+			if ( isset( $extra[ $safe_key ] )
+				&& is_array( $extra[ $safe_key ] )
+				&& ! empty( $extra[ $safe_key ] )
+			) {
+				$inject[ $safe_key ] = $extra[ $safe_key ];
+			}
+		}
+
+		return $inject;
+	}
+
+	private static function should_disable_chat_template_kwargs_for_model( string $model_slug ): bool {
+		$normalized = strtolower( trim( $model_slug ) );
+		if ( '' === $normalized ) {
+			return false;
+		}
+
+		// Hosted Mistral model IDs are lowercase API catalog slugs such as
+		// mistral-medium, mistral-large-latest, or ministral-8b-latest.
+		// Local quantized models use names like Ministral-8B-Instruct-2410-Q4_K_M
+		// and still need enable_thinking=false for stable output.
+		if ( false !== strpos( $normalized, '_' ) || false !== strpos( $normalized, 'q4' ) || false !== strpos( $normalized, 'q5' ) || false !== strpos( $normalized, 'q6' ) || false !== strpos( $normalized, 'q8' ) ) {
+			return false;
+		}
+
+		foreach ( array(
+			'mistral-',
+			'open-mistral-',
+			'ministral-',
+			'codestral',
+			'devstral',
+			'magistral',
+			'pixtral',
+			'voxtral',
+			'labs-leanstral',
+		) as $prefix ) {
+			if ( 0 === strpos( $normalized, $prefix ) ) {
+				return true;
+			}
+		}
+
+		return false;
+	}
+
+	private static function get_model_slug_cache_key( string $model_slug ): string {
+		return strtolower( trim( $model_slug ) );
+	}
+
+	private static function can_send_chat_template_kwargs_for_model( string $model_slug ): bool {
+		$cache_key = self::get_model_slug_cache_key( $model_slug );
+		if ( '' === $cache_key ) {
+			return true;
+		}
+
+		if ( array_key_exists( $cache_key, self::$wp_ai_client_kwargs_support_cache ) ) {
+			return (bool) self::$wp_ai_client_kwargs_support_cache[ $cache_key ];
+		}
+
+		return true;
+	}
+
+	private static function remember_chat_template_kwargs_support_for_model( string $model_slug, bool $is_supported ): void {
+		$cache_key = self::get_model_slug_cache_key( $model_slug );
+		if ( '' === $cache_key ) {
+			return;
+		}
+
+		self::$wp_ai_client_kwargs_support_cache[ $cache_key ] = $is_supported;
+	}
+
+	private static function get_wp_ai_client_request_body_injections_for_model(
+		array $model_profile,
+		string $model_slug,
+		bool $force_disable_chat_template_kwargs = false
+	): array {
+		$allow_kwargs = ! $force_disable_chat_template_kwargs
+			&& self::can_send_chat_template_kwargs_for_model( $model_slug );
+
+		return self::extract_wp_ai_client_request_body_injections( $model_profile, $allow_kwargs, $model_slug );
+	}
+
+	private static function has_chat_template_kwargs_injections( array $injections ): bool {
+		return isset( $injections['chat_template_kwargs'] )
+			&& is_array( $injections['chat_template_kwargs'] )
+			&& ! empty( $injections['chat_template_kwargs'] );
+	}
+
+	private static function is_chat_template_kwargs_unsupported_error( \WP_Error $error ): bool {
+		foreach ( self::get_transport_error_fragments( $error ) as $fragment ) {
+			$normalized = strtolower( (string) $fragment );
+			if ( '' === $normalized ) {
+				continue;
+			}
+
+			if ( false === strpos( $normalized, 'chat_template_kwargs' )
+				&& false === strpos( $normalized, 'chat-template-kwargs' )
+				&& false === strpos( $normalized, 'template kwargs' )
+			) {
+				continue;
+			}
+
+			if ( false !== strpos( $normalized, 'unsupported' )
+				|| false !== strpos( $normalized, 'unknown' )
+				|| false !== strpos( $normalized, 'unexpected' )
+				|| false !== strpos( $normalized, 'not allowed' )
+				|| false !== strpos( $normalized, 'invalid' )
+				|| false !== strpos( $normalized, 'unrecognized' )
+				|| false !== strpos( $normalized, 'additional propert' )
+			) {
+				return true;
+			}
+		}
+
+		return false;
+	}
+
+	private static function should_retry_wp_ai_client_without_kwargs(
+		\WP_Error $error,
+		array $model_profile,
+		array $injections
+	): bool {
+		if ( ! self::has_chat_template_kwargs_injections( $injections ) ) {
+			return false;
+		}
+
+		if ( ! empty( $model_profile['requires_chat_template_kwargs'] ) ) {
+			return false;
+		}
+
+		return self::is_chat_template_kwargs_unsupported_error( $error );
+	}
+
+	private static function execute_wp_ai_client_request(
+		array $transport_payload,
+		string $model_slug,
+		int $max_output_tokens,
+		array $injections
+	): mixed {
+		$builder = wp_ai_client_prompt( (string) $transport_payload['user_content'] );
+
+		if ( ! empty( $transport_payload['use_system_prompt'] )
+			&& is_callable( array( $builder, 'using_system_instruction' ) )
+		) {
+			$builder = $builder->using_system_instruction( (string) $transport_payload['system_prompt'] );
+		}
+
+		if ( is_callable( array( $builder, 'using_temperature' ) ) ) {
+			$temperature = is_numeric( $transport_payload['temperature'] ?? null ) ? (float) $transport_payload['temperature'] : 0.0;
+
+			try {
+				$builder = $builder->using_temperature( $temperature );
+			} catch ( \TypeError $e ) {
+				$builder = $builder->using_temperature( (int) round( $temperature ) );
+			}
+		}
+
+		if ( '' !== $model_slug && is_callable( array( $builder, 'using_model_preference' ) ) ) {
+			$builder = $builder->using_model_preference( $model_slug );
+		}
+
+		if ( is_callable( array( $builder, 'using_max_tokens' ) ) ) {
+			$builder = $builder->using_max_tokens( $max_output_tokens );
+		} elseif ( is_callable( array( $builder, 'using_max_output_tokens' ) ) ) {
+			$builder = $builder->using_max_output_tokens( $max_output_tokens );
+		}
+
+		return self::with_reasoning_response_normalization_filter(
+			fn() => self::with_wp_ai_client_request_body_filter(
+				$injections,
+				static fn() => $builder->generate_text()
+			)
+		);
+	}
+
+	/**
+	 * Pure helper that merges request-body injections into a wp_remote_post
+	 * args array for chat-completions endpoints. Extracted so it can be unit
+	 * tested without registering filters.
+	 *
+	 * @param array  $args HTTP request args from the http_request_args filter.
+	 * @param string $url  Outgoing request URL.
+	 * @param array  $injections Body keys to merge (e.g. chat_template_kwargs, provider, reasoning).
+	 * @return array Possibly mutated args.
+	 */
+	public static function inject_extra_request_body_into_http_args( array $args, string $url, array $injections ): array {
+		$method = strtoupper( (string) ( $args['method'] ?? 'POST' ) );
+		if ( 'POST' !== $method ) {
+			return $args;
+		}
+
+		if ( false === strpos( $url, '/chat/completions' ) ) {
+			return $args;
+		}
+
+		$body = $args['body'] ?? '';
+		if ( ! is_string( $body ) || '' === $body ) {
+			return $args;
+		}
+
+		$decoded = json_decode( $body, true );
+		if ( ! is_array( $decoded ) ) {
+			return $args;
+		}
+
+		$strip_chat_template_kwargs = self::should_strip_chat_template_kwargs_for_mistral_request( $url, $decoded );
+
+		if ( $strip_chat_template_kwargs ) {
+			unset( $decoded['chat_template_kwargs'] );
+		}
+
+		if ( empty( $injections ) ) {
+			$encoded = wp_json_encode( $decoded );
+			if ( is_string( $encoded ) ) {
+				$args['body'] = $encoded;
+			}
+
+			return $args;
+		}
+
+		foreach ( $injections as $key => $value ) {
+			$key = (string) $key;
+			if ( in_array( $key, array( 'messages', 'model' ), true ) ) {
+				continue;
+			}
+
+			if ( 'chat_template_kwargs' === $key && $strip_chat_template_kwargs ) {
+				continue;
+			}
+
+			if ( 'chat_template_kwargs' === $key
+				&& isset( $decoded['chat_template_kwargs'] )
+				&& is_array( $decoded['chat_template_kwargs'] )
+				&& is_array( $value )
+			) {
+				$decoded['chat_template_kwargs'] = array_merge( $decoded['chat_template_kwargs'], $value );
+				continue;
+			}
+
+			$decoded[ $key ] = $value;
+		}
+
+		$encoded = wp_json_encode( $decoded );
+		if ( is_string( $encoded ) ) {
+			$args['body'] = $encoded;
+		}
+
+		return $args;
+	}
+
+	/**
+	 * Mistral's hosted chat/completions API rejects chat_template_kwargs.
+	 * Strip the field entirely for those requests so connector-based model
+	 * profiles can still use the shared injection path for other providers.
+	 *
+	 * @param string $url     Outgoing request URL.
+	 * @param array  $decoded Decoded request body.
+	 * @return bool True when chat_template_kwargs must be removed.
+	 */
+	private static function should_strip_chat_template_kwargs_for_mistral_request( string $url, array $decoded ): bool {
+		if ( false === strpos( $url, '/chat/completions' ) || false === strpos( $url, 'api.mistral.ai' ) ) {
+			return false;
+		}
+
+		if ( ! array_key_exists( 'chat_template_kwargs', $decoded ) ) {
+			return false;
+		}
+
+		$model = $decoded['model'] ?? '';
+		if ( ! is_string( $model ) || '' === $model ) {
+			return false;
+		}
+
+		return false !== stripos( $model, 'mistral' )
+			|| false !== stripos( $model, 'ministral' );
+	}
+
+	/**
+	 * Wrap a callable that performs WP AI Client requests with a temporary
+	 * http_request_args filter that merges $injections into outgoing
+	 * chat-completions request bodies.
+	 *
+	 * @param array    $injections Body keys to merge.
+	 * @param callable $callback   Callable that triggers the HTTP request.
+	 * @return mixed Whatever the callback returns.
+	 */
+	private static function with_wp_ai_client_request_body_filter( array $injections, callable $callback ): mixed {
+		if ( empty( $injections ) ) {
+			return $callback();
+		}
+
+		$filter = static function ( $args, $url ) use ( $injections ) {
+			if ( ! is_array( $args ) || ! is_string( $url ) ) {
+				return $args;
+			}
+			return self::inject_extra_request_body_into_http_args( $args, $url, $injections );
+		};
+
+		// Run late so provider plugins cannot re-add stripped keys like
+		// chat_template_kwargs on hosted Mistral requests after our mutation.
+		add_filter( 'http_request_args', $filter, 9999, 2 );
+		try {
+			return $callback();
+		} finally {
+			remove_filter( 'http_request_args', $filter, 9999 );
+		}
+	}
+
+	/**
+	 * Normalise a chat-completions response body so that models which return
+	 * their output exclusively in the `reasoning` field (thinking models that
+	 * ignore `enable_thinking=false` on remote connectors like OpenRouter) are
+	 * still usable: when `choices[0].message.content` is null or empty but
+	 * `choices[0].message.reasoning` (or `reasoning_content`) carries text, the
+	 * reasoning text is promoted to `content`.
+	 *
+	 * This runs before the WordPress AI Client parses the response, so it never
+	 * reaches the "No text content found in first candidate." error.
+	 *
+	 * @param string $body Raw JSON response body from the upstream API.
+	 * @return string Possibly modified JSON body; original on any parse failure.
+	 */
+	public static function normalize_reasoning_only_response_body( string $body ): string {
+		if ( '' === $body ) {
+			return $body;
+		}
+
+		$decoded = json_decode( $body, true );
+		if ( ! is_array( $decoded ) ) {
+			return $body;
+		}
+
+		$choices = $decoded['choices'] ?? null;
+		if ( ! is_array( $choices ) || empty( $choices ) ) {
+			return $body;
+		}
+
+		$message = $choices[0]['message'] ?? null;
+		if ( ! is_array( $message ) ) {
+			return $body;
+		}
+
+		$content = $message['content'] ?? null;
+		if ( is_string( $content ) && '' !== trim( $content ) ) {
+			return $body;
+		}
+
+		$reasoning = null;
+		foreach ( array( 'reasoning', 'reasoning_content' ) as $key ) {
+			if ( isset( $message[ $key ] ) && is_string( $message[ $key ] ) && '' !== trim( $message[ $key ] ) ) {
+				$reasoning = $message[ $key ];
+				break;
+			}
+		}
+
+		if ( null === $reasoning ) {
+			return $body;
+		}
+
+		$decoded['choices'][0]['message']['content'] = $reasoning;
+
+		$encoded = wp_json_encode( $decoded );
+		return is_string( $encoded ) ? $encoded : $body;
+	}
+
+	/**
+	 * Wrap a callable that triggers WP AI Client HTTP requests with a temporary
+	 * `http_response` filter that promotes reasoning-only API responses so the
+	 * WP AI Client can parse them as regular text responses.
+	 *
+	 * @param callable $callback Callable that triggers the HTTP request.
+	 * @return mixed Whatever the callback returns.
+	 */
+	private static function with_reasoning_response_normalization_filter( callable $callback ): mixed {
+		$filter = static function ( $response, $parsed_args, $url ) {
+			if ( ! is_array( $response ) || ! is_string( $url ) ) {
+				return $response;
+			}
+
+			if ( false === strpos( $url, '/chat/completions' ) ) {
+				return $response;
+			}
+
+			$body = $response['body'] ?? '';
+			if ( ! is_string( $body ) || '' === $body ) {
+				return $response;
+			}
+
+			$normalized = self::normalize_reasoning_only_response_body( $body );
+			if ( $normalized !== $body ) {
+				$response['body'] = $normalized;
+			}
+
+			return $response;
+		};
+
+		add_filter( 'http_response', $filter, 1, 3 );
+		try {
+			return $callback();
+		} finally {
+			remove_filter( 'http_response', $filter, 1 );
+		}
+	}
+
+	private static function build_profile_extra_request_body( array $model_profile, string $model_slug, bool $kwargs_supported ): array {
+		$extra = $model_profile['extra_request_body'] ?? array();
+		if ( ! is_array( $extra ) || empty( $extra ) ) {
+			return array();
+		}
+
+		$extra = self::replace_profile_placeholders( $extra );
+		$extra = self::apply_model_specific_extra_request_body_overrides( $extra, $model_slug );
+
+		if ( self::should_disable_chat_template_kwargs_for_model( $model_slug ) ) {
+			unset( $extra['chat_template_kwargs'] );
+		}
+
+		if ( isset( $extra['chat_template_kwargs'] ) ) {
+			$has_languages = is_string( self::$source_lang ) && '' !== self::$source_lang
+				&& is_string( self::$target_lang ) && '' !== self::$target_lang;
+
+			if ( ! $kwargs_supported || ! $has_languages || ! is_array( $extra['chat_template_kwargs'] ) ) {
+				unset( $extra['chat_template_kwargs'] );
+			}
+		}
+
+		return $extra;
+	}
+
+	private static function build_transport_payload(
+		string $source_text,
+		string $prompt,
+		array $model_profile,
+		string $model_slug,
+		bool $kwargs_supported,
+		int $validation_attempt
+	): array {
+		$request_mode   = (string) ( $model_profile['request_mode'] ?? self::REQUEST_MODE_SYSTEM_PLUS_USER );
+		$prompt_style   = (string) ( $model_profile['prompt_style'] ?? self::PROMPT_STYLE_GENERIC_TEMPLATE );
+		$system_prompt  = $prompt;
+		$user_content   = $source_text;
+		$use_system     = self::REQUEST_MODE_SYSTEM_PLUS_USER === $request_mode && ! empty( $model_profile['supports_system_role'] );
+		$temperature    = is_numeric( $model_profile['temperature'] ?? null ) ? (float) $model_profile['temperature'] : 0.0;
+
+		if ( self::PROMPT_STYLE_BILINGUAL_FRAME === $prompt_style ) {
+			$user_content = self::build_bilingual_frame_prompt( $source_text, $prompt, $validation_attempt );
+			$system_prompt = '';
+			$use_system    = false;
+		} elseif ( self::REQUEST_MODE_USER_ONLY === $request_mode ) {
+			$system_prompt = '';
+			$use_system    = false;
+		}
+
+		return array(
+			'user_content'       => $user_content,
+			'system_prompt'      => $system_prompt,
+			'use_system_prompt'  => $use_system,
+			'temperature'        => $temperature,
+			'extra_request_body' => self::build_profile_extra_request_body( $model_profile, $model_slug, $kwargs_supported ),
+		);
+	}
+
+	private static function apply_chunk_strategy_to_limit( int $chunk_char_limit, array $model_profile ): int {
+		$chunk_strategy = (string) ( $model_profile['chunk_strategy'] ?? self::CHUNK_STRATEGY_DEFAULT );
+
+		if ( self::CHUNK_STRATEGY_TOWER === $chunk_strategy ) {
+			$conservative = (int) floor( $chunk_char_limit * 0.6 );
+			$cap          = absint( $model_profile['max_chunk_chars'] ?? 0 );
+			if ( $cap > 0 ) {
+				$conservative = min( $conservative, $cap );
+			}
+
+			$chunk_char_limit = max( self::MIN_TRANSLATION_CHARS, $conservative );
+		}
+
+		return max( self::MIN_TRANSLATION_CHARS, min( self::MAX_TRANSLATION_CHARS, $chunk_char_limit ) );
+	}
+
+	public static function translate_chunk( string $text, string $prompt, int $validation_attempt = 0, bool $skip_validation = false ): mixed {
+		$runtime_context = self::get_runtime_context();
+		$model_slug      = self::$model_slug_override ?? $runtime_context['model_slug'];
+		$model_profile   = self::get_model_profile( $model_slug );
+
+		if ( empty( $model_profile['supports_chat_completions'] ) ) {
+			$error_message = sprintf(
+				/* translators: %s: model slug. */
+				__( 'Model "%s" is not compatible with chat/completions translation in SlyTranslate. Please choose another model.', 'slytranslate' ),
+				'' !== $model_slug ? $model_slug : 'unknown'
+			);
+			self::record_transport_diagnostics( array(
+				'transport'        => 'blocked',
+				'model_slug'       => $model_slug,
+				'fallback_allowed' => false,
+				'failure_reason'   => 'chat_transport_unsupported',
+				'error_code'       => 'model_chat_transport_unsupported',
+				'error_message'    => $error_message,
+			) );
+
+			return new \WP_Error( 'model_chat_transport_unsupported', $error_message );
+		}
+
+		$input_chars       = self::char_length( $text );
+		$max_output_tokens = self::compute_max_output_tokens( $input_chars );
+		$transport_payload = self::build_transport_payload( $text, $prompt, $model_profile, $model_slug, true, $validation_attempt );
+
+		$wp_started         = TimingLogger::start();
+		$primary_injections = self::get_wp_ai_client_request_body_injections_for_model( $model_profile, $model_slug );
+
+		self::record_transport_diagnostics( array(
+			'transport'        => 'wp_ai_client',
+			'model_slug'       => $model_slug,
+			'fallback_allowed' => true,
+			'failure_reason'   => '',
+		) );
+
+		$result = self::execute_wp_ai_client_request(
+			$transport_payload,
+			$model_slug,
+			$max_output_tokens,
+			$primary_injections
+		);
+
+		if ( is_wp_error( $result )
+			&& self::should_retry_wp_ai_client_without_kwargs( $result, $model_profile, $primary_injections )
+		) {
+			self::remember_chat_template_kwargs_support_for_model( $model_slug, false );
+			TimingLogger::increment( 'retries' );
+			TimingLogger::increment( 'fallbacks' );
+			TimingLogger::log( 'ai_call_fallback', array(
+				'from'   => 'wp_ai_client',
+				'to'     => 'wp_ai_client_no_kwargs',
+				'reason' => 'chat_template_kwargs_unsupported',
+				'model'  => $model_slug,
+			) );
+
+			$fallback_injections = self::get_wp_ai_client_request_body_injections_for_model( $model_profile, $model_slug, true );
+			$result              = self::execute_wp_ai_client_request(
+				$transport_payload,
+				$model_slug,
+				$max_output_tokens,
+				$fallback_injections
+			);
+		}
+
+		if ( ! is_wp_error( $result ) && self::has_chat_template_kwargs_injections( $primary_injections ) ) {
+			self::remember_chat_template_kwargs_support_for_model( $model_slug, true );
+		}
+
+		$wp_duration_ms = TimingLogger::stop( $wp_started );
+		TimingLogger::increment( 'ai_calls' );
+		TimingLogger::increment( 'ai_input_chars', $input_chars );
+
+		if ( is_wp_error( $result ) ) {
+			$result = self::normalize_transport_error( $result, $model_slug );
+
+			self::record_transport_diagnostics( array(
+				'transport'        => 'wp_ai_client',
+				'model_slug'       => $model_slug,
+				'fallback_allowed' => true,
+				'failure_reason'   => $result->get_error_code(),
+				'error_code'       => $result->get_error_code(),
+				'error_message'    => $result->get_error_message(),
+			) );
+
+			TimingLogger::log( 'ai_call', array(
+				'transport'    => 'wp_ai_client',
+				'model'        => $model_slug,
+				'input_chars'  => $input_chars,
+				'output_chars' => 0,
+				'duration_ms'  => $wp_duration_ms,
+				'attempt'      => $validation_attempt,
+				'ok'           => false,
+				'reason'       => $result->get_error_code(),
+			) );
+
+			if ( self::is_rate_limit_error( $result ) ) {
+				return self::handle_rate_limit_and_retry( $result, $text, $prompt, $validation_attempt, $model_slug, $skip_validation );
+			}
+
+			return $result;
+		}
+
+		$output_chars = is_string( $result ) ? self::char_length( $result ) : 0;
+		TimingLogger::increment( 'ai_output_chars', $output_chars );
+		TimingLogger::log( 'ai_call', array(
+			'transport'    => 'wp_ai_client',
+			'model'        => $model_slug,
+			'input_chars'  => $input_chars,
+			'output_chars' => $output_chars,
+			'duration_ms'  => $wp_duration_ms,
+			'attempt'      => $validation_attempt,
+			'ok'           => true,
+		) );
+
+		if ( $skip_validation ) {
+			return $result;
+		}
+
+		return self::finalize_translated_chunk( $text, $result, $model_slug, $prompt, $validation_attempt );
+	}
+
+	/**
+	 * Unwrap pseudo-XML translations like `<responsible>` or
+	 * `<communication-partner>` that small models (notably Phi-4-mini)
+	 * occasionally emit when asked to translate single noun-like inputs.
+	 * The model intends the inner identifier as the translation but wraps
+	 * it in angle brackets, which `wp_strip_all_tags()` then removes,
+	 * making the validator see "no plain text" and the entire content
+	 * phase abort over a single short word.
+	 *
+	 * Only triggered when the source itself contained no `<` characters
+	 * (so we don't strip legitimate HTML the model echoed back), the
+	 * output trims to one bare tag with no attributes, and the tag name
+	 * looks like a single word or hyphenated identifier (letters and
+	 * single hyphens only). The unwrapped form replaces hyphens with
+	 * spaces — `<communication-partner>` becomes `communication partner`.
+	 */
+	private static function unwrap_pseudo_tag_translation( string $source_text, string $translated_text ): string {
+		$trimmed = trim( $translated_text );
+		if ( '' === $trimmed ) {
+			return $translated_text;
+		}
+
+		if ( false !== strpos( $source_text, '<' ) ) {
+			return $translated_text;
+		}
+
+		if ( ! preg_match( '/^<([A-Za-z][A-Za-z0-9]*(?:-[A-Za-z0-9]+)*)>$/', $trimmed, $match ) ) {
+			return $translated_text;
+		}
+
+		return str_replace( '-', ' ', $match[1] );
+	}
+
+	private static function unwrap_full_markdown_emphasis_translation( string $source_text, string $translated_text ): string {
+		$trimmed = trim( $translated_text );
+		if ( '' === $trimmed || false !== strpos( $trimmed, "\n" ) ) {
+			return $translated_text;
+		}
+
+		$source_trimmed = trim( $source_text );
+		foreach ( array( '**', '__', '*', '_' ) as $marker ) {
+			$marker_length = strlen( $marker );
+			if ( strlen( $trimmed ) <= ( $marker_length * 2 ) ) {
+				continue;
+			}
+
+			if ( 0 !== strpos( $trimmed, $marker ) || ! str_ends_with( $trimmed, $marker ) ) {
+				continue;
+			}
+
+			if ( 0 === strpos( $source_trimmed, $marker ) && str_ends_with( $source_trimmed, $marker ) ) {
+				return $translated_text;
+			}
+
+			$inner = substr( $trimmed, $marker_length, -$marker_length );
+			if ( ! is_string( $inner ) || '' === trim( $inner ) || false !== strpos( $inner, "\n" ) ) {
+				continue;
+			}
+
+			return trim( $inner );
+		}
+
+		return $translated_text;
+	}
+
+	private static function finalize_translated_chunk(
+		string $source_text,
+		string $translated_text,
+		string $model_slug,
+		string $prompt,
+		int $validation_attempt
+	): mixed {
+		if ( self::PROMPT_STYLE_BILINGUAL_FRAME === self::get_prompt_style_for_model( $model_slug ) ) {
+			$translated_text = self::extract_bilingual_frame_translation( $translated_text );
+		}
+
+		$translated_text  = self::unwrap_pseudo_tag_translation( $source_text, $translated_text );
+		$translated_text  = self::unwrap_full_markdown_emphasis_translation( $source_text, $translated_text );
+		$translated_text  = TranslationValidator::normalize_symbol_notation( $source_text, $translated_text );
+		$validation_error = TranslationValidator::validate( $source_text, $translated_text, self::$target_lang );
+
+		if ( is_wp_error( $validation_error ) ) {
+			self::record_validation_failure_diagnostics( $validation_error );
+			$validation_error_code = (string) $validation_error->get_error_code();
+
+			TimingLogger::log( 'ai_validation_failed', array(
+				'model'           => $model_slug,
+				'reason'          => $validation_error_code,
+				'attempt'         => $validation_attempt,
+				'source_chars'    => self::char_length( $source_text ),
+				'output_chars'    => self::char_length( $translated_text ),
+				'source_excerpt'  => self::truncate_for_log( $source_text ),
+				'output_excerpt'  => self::truncate_for_log( $translated_text ),
+			) );
+
+			if ( 0 === $validation_attempt && self::should_retry_after_validation_failure( $model_slug, $validation_error_code ) ) {
+				TimingLogger::increment( 'retries' );
+				TimingLogger::log( 'ai_validation_retry', array(
+					'model'  => $model_slug,
+					'reason' => $validation_error_code,
+				) );
+
+				$retry_prompt      = self::build_retry_prompt( $prompt, $model_slug, $validation_error_code );
+				$retry_chunk_limit = self::get_retry_chunk_limit_for_validation_failure( $model_slug, $validation_error_code );
+
+				if ( $retry_chunk_limit >= self::MIN_TRANSLATION_CHARS
+					&& self::char_length( $source_text ) > $retry_chunk_limit
+				) {
+					return self::translate_with_chunk_limit( $source_text, $retry_prompt, $retry_chunk_limit, 0, false );
+				}
+
+				return self::translate_chunk( $source_text, $retry_prompt, 1 );
+			}
+
+		$plain_prompt_recovery_codes = array(
+				'invalid_translation_empty',
+				// Models that persistently echo the system prompt (e.g. Nemotron Free on
+				// OpenRouter) produce assistant_reply failures on both attempt=0 and
+				// attempt=1. A third attempt with a user-only plain prompt (no system
+				// message) has a better chance of producing a clean translation.
+				'invalid_translation_assistant_reply',
+				// Some models keep returning the source language unchanged on both the
+				// first attempt and the retry. Allow the same user-only plain-prompt
+				// recovery path to salvage a real translation before the caller keeps
+				// the block in the source language.
+				'invalid_translation_language_passthrough',
+			);
+
+			if ( in_array( $validation_error_code, $plain_prompt_recovery_codes, true ) && 1 === $validation_attempt ) {
+				TimingLogger::increment( 'retries' );
+				TimingLogger::increment( 'fallbacks' );
+				TimingLogger::log( 'ai_validation_retry', array(
+					'model'    => $model_slug,
+					'reason'   => $validation_error_code,
+					'strategy' => 'plain_prompt_recovery',
+				) );
+				TimingLogger::log( 'ai_call_fallback', array(
+					'from'   => 'wp_ai_client',
+					'to'     => 'wp_ai_client_plain_prompt',
+					'reason' => $validation_error_code,
+					'model'  => $model_slug,
+				) );
+
+				$plain_result = self::translate_chunk_with_plain_prompt_recovery( $source_text, $model_slug );
+				if ( is_wp_error( $plain_result ) ) {
+					// Transport-level error (e.g. empty output, model refused request).
+					// Wrap as a validator-style error so ContentTranslator handles this
+					// gracefully (keeps the block in source language) instead of
+					// propagating a hard 500 for the whole translation job.
+					return new \WP_Error(
+						'invalid_translation_assistant_reply',
+						$plain_result->get_error_message()
+					);
+				}
+
+				return self::finalize_translated_chunk( $source_text, $plain_result, $model_slug, $prompt, 2 );
+			}
+
+			return $validation_error;
+		}
+
+		return $translated_text;
+	}
+
+	private static function translate_chunk_with_plain_prompt_recovery( string $source_text, string $model_slug ): mixed {
+		$input_chars       = self::char_length( $source_text );
+		$max_output_tokens = self::compute_max_output_tokens( $input_chars );
+		// Use a minimal quoted-arrow completion format:
+		//   "{source_text}" →
+		// No language labels, no instruction verbs, no "translate"/"return only" phrases
+		// that thinking-mode models (Nemotron on OpenRouter) echo back verbatim.
+		// The arrow (→) is a universally-understood translation cue that produces only
+		// the target text without triggering thinking-mode explanations.
+		$user_content = self::build_plain_prompt_recovery_input( $source_text );
+
+		$wp_started = TimingLogger::start();
+		$builder    = wp_ai_client_prompt( $user_content );
+
+		if ( is_callable( array( $builder, 'using_temperature' ) ) ) {
+			try {
+				$builder = $builder->using_temperature( 0.0 );
+			} catch ( \TypeError $e ) {
+				$builder = $builder->using_temperature( 0 );
+			}
+		}
+
+		if ( '' !== $model_slug && is_callable( array( $builder, 'using_model_preference' ) ) ) {
+			$builder = $builder->using_model_preference( $model_slug );
+		}
+
+		if ( is_callable( array( $builder, 'using_max_tokens' ) ) ) {
+			$builder = $builder->using_max_tokens( $max_output_tokens );
+		} elseif ( is_callable( array( $builder, 'using_max_output_tokens' ) ) ) {
+			$builder = $builder->using_max_output_tokens( $max_output_tokens );
+		}
+
+		$result         = self::with_wp_ai_client_request_body_filter(
+			self::get_wp_ai_client_request_body_injections_for_model( self::get_model_profile( $model_slug ), $model_slug ),
+			static fn() => $builder->generate_text()
+		);
+		$wp_duration_ms = TimingLogger::stop( $wp_started );
+		TimingLogger::increment( 'ai_calls' );
+		TimingLogger::increment( 'ai_input_chars', $input_chars );
+
+		if ( is_wp_error( $result ) ) {
+			$result = self::normalize_transport_error( $result, $model_slug );
+
+			TimingLogger::log( 'ai_call', array(
+				'transport'    => 'wp_ai_client_plain',
+				'model'        => $model_slug,
+				'input_chars'  => $input_chars,
+				'output_chars' => 0,
+				'duration_ms'  => $wp_duration_ms,
+				'attempt'      => 2,
+				'ok'           => false,
+				'reason'       => $result->get_error_code(),
+			) );
+
+			self::record_transport_diagnostics( array(
+				'transport'        => 'wp_ai_client_plain',
+				'model_slug'       => $model_slug,
+				'fallback_allowed' => true,
+				'failure_reason'   => $result->get_error_code(),
+				'error_code'       => $result->get_error_code(),
+				'error_message'    => $result->get_error_message(),
+			) );
+
+			return $result;
+		}
+
+		$output_chars = is_string( $result ) ? self::char_length( $result ) : 0;
+		TimingLogger::increment( 'ai_output_chars', $output_chars );
+		TimingLogger::log( 'ai_call', array(
+			'transport'    => 'wp_ai_client_plain',
+			'model'        => $model_slug,
+			'input_chars'  => $input_chars,
+			'output_chars' => $output_chars,
+			'duration_ms'  => $wp_duration_ms,
+			'attempt'      => 2,
+			'ok'           => is_string( $result ),
+		) );
+
+		if ( ! is_string( $result ) ) {
+			return new \WP_Error(
+				'invalid_translation_empty',
+				__( 'The model returned an empty translation result.', 'slytranslate' )
+			);
+		}
+
+		self::record_transport_diagnostics( array(
+			'transport'        => 'wp_ai_client_plain',
+			'model_slug'       => $model_slug,
+			'fallback_allowed' => true,
+			'failure_reason'   => '',
+			'error_code'       => '',
+			'error_message'    => '',
+		) );
+
+		return $result;
+	}
+
+	private static function build_plain_prompt_recovery_input( string $source_text ): string {
+		$placeholders = self::extract_brace_placeholders( $source_text );
+		if ( empty( $placeholders ) ) {
+			return sprintf( '"%1$s" →', $source_text );
+		}
+
+		$source_label = self::resolve_language_label( is_string( self::$source_lang ) ? self::$source_lang : null, 'Source' );
+		$target_label = self::resolve_language_label( is_string( self::$target_lang ) ? self::$target_lang : null, 'Target' );
+
+		return implode(
+			"\n",
+			array(
+				sprintf( 'Translate from %1$s to %2$s.', $source_label, $target_label ),
+				'Preserve every placeholder token exactly as written. Do not translate, rename, remove, or explain them.',
+				'If parts of the text are already valid target-language text, keep those parts unchanged and translate only the remaining source-language fragments.',
+				'Placeholders: ' . implode( ', ', $placeholders ),
+				'Return only the translated text.',
+				$source_text,
+			)
+		);
+	}
+
+	/**
+	 * @return string[]
+	 */
+	private static function extract_brace_placeholders( string $text ): array {
+		$matches = array();
+		if ( preg_match_all( '/\{[a-z0-9_\-.]+\}/iu', $text, $matches ) < 1 ) {
+			return array();
+		}
+
+		$placeholders = isset( $matches[0] ) && is_array( $matches[0] ) ? $matches[0] : array();
+		$placeholders = array_values( array_unique( array_filter( array_map( 'strval', $placeholders ) ) ) );
+
+		return $placeholders;
+	}
+
+	/* ---------------------------------------------------------------
+	 * Context-window heuristics
+	 * ------------------------------------------------------------- */
+
+	public static function get_chunk_char_limit(): int {
+		if ( null !== self::$chunk_char_limit_cache ) {
+			return self::$chunk_char_limit_cache;
+		}
+
+		$runtime_context      = self::get_runtime_context();
+		$context_window_size  = self::get_effective_context_window_tokens();
+		$chunk_char_limit     = self::get_chunk_char_limit_from_context_window( $context_window_size );
+		$model_profile        = self::get_model_profile( (string) ( $runtime_context['model_slug'] ?? '' ) );
+
+		$filtered_limit = apply_filters( 'slytranslate_chunk_char_limit', $chunk_char_limit, $context_window_size, $runtime_context );
+		$filtered_limit = absint( $filtered_limit );
+		if ( $filtered_limit > 0 ) {
+			$chunk_char_limit = $filtered_limit;
+		}
+
+		$chunk_char_limit = self::apply_chunk_strategy_to_limit( $chunk_char_limit, $model_profile );
+
+		self::$chunk_char_limit_cache = max( self::MIN_TRANSLATION_CHARS, min( self::MAX_TRANSLATION_CHARS, $chunk_char_limit ) );
+		return self::$chunk_char_limit_cache;
+	}
+
+	public static function get_chunk_char_limit_from_context_window( int $context_window_tokens ): int {
+		$context_window_tokens = max( self::MIN_CONTEXT_WINDOW_TOKENS, $context_window_tokens );
+		$chunk_char_limit      = (int) floor( $context_window_tokens * self::SAFE_CHARS_PER_CONTEXT_TOKEN );
+
+		return max( self::MIN_TRANSLATION_CHARS, min( self::MAX_TRANSLATION_CHARS, $chunk_char_limit ) );
+	}
+
+	public static function get_effective_context_window_tokens(): int {
+		$configured = absint( get_option( 'slytranslate_context_window_tokens', 0 ) );
+		if ( $configured > 0 ) {
+			return max( self::MIN_CONTEXT_WINDOW_TOKENS, $configured );
+		}
+
+		$runtime_context     = self::get_runtime_context();
+		$context_window_size = self::get_learned_context_window_tokens();
+
+		if ( $context_window_size < 1 ) {
+			$context_window_size = self::get_known_context_window_for_model( $runtime_context['model_slug'] );
+		}
+
+		if ( $context_window_size < 1 ) {
+			$context_window_size = self::DEFAULT_CONTEXT_WINDOW_TOKENS;
+		}
+
+		$filtered = apply_filters( 'slytranslate_context_window_tokens', $context_window_size, $runtime_context );
+		$filtered = absint( $filtered );
+		if ( $filtered > 0 ) {
+			$context_window_size = $filtered;
+		}
+
+		return max( self::MIN_CONTEXT_WINDOW_TOKENS, $context_window_size );
+	}
+
+	/**
+	 * Run `ConfigurationService::probe_and_remember_direct_api_context_windows()`
+	 * at most once per day for a given endpoint. Returns true when the probe
+	 * actually ran (so the caller knows to re-read the learned window).
+	 */
+	private static function maybe_autoprobe_direct_api_context_windows( string $api_url ): bool {
+		$last_probed_at = (int) get_option( 'slytranslate_direct_api_models_last_probed_at', 0 );
+		if ( $last_probed_at > 0 && ( time() - $last_probed_at ) < DAY_IN_SECONDS ) {
+			return false;
+		}
+
+		// Record the attempt before probing so a failing endpoint does not
+		// get re-hit on every translation request.
+		update_option( 'slytranslate_direct_api_models_last_probed_at', time(), false );
+		ConfigurationService::probe_and_remember_direct_api_context_windows( $api_url );
+
+		return true;
+	}
+
+	public static function get_runtime_context(): array {
+		if ( is_array( self::$context ) ) {
+			return self::$context;
+		}
+
+		$direct_api_url = '';
+		$model_slug     = self::normalize_requested_model_slug( get_option( 'slytranslate_model_slug', '' ) );
+
+		// Final fallback in the model-selection hierarchy:
+		//   1. per-call override (with_model_slug_override())
+		//   2. plugin DB option ai_translate_model_slug (handled above)
+		//   3. AI Client connector default (handled here)
+		//
+		// The WP AI Client itself does not always pass a connector's default
+		// model id down to the OpenAI-compatible HTTP request, which on
+		// llama-swap / llama.cpp setups results in an empty `model` field and
+		// the endpoint serving whatever model happens to be currently loaded —
+		// silently overriding the user's connector choice.
+		//
+		// To stay connector-agnostic (so we work with Ultimate AI Connector,
+		// the official OpenAI connector, Anthropic, Google, or any other
+		// plugin that registers itself with the WP AI Client) we resolve the
+		// default by asking the AI Client registry for the first model that
+		// matches the basic text-generation requirements — the same call
+		// EditorBootstrap uses to populate the editor's model dropdown. The
+		// `slytranslate_default_model_slug` filter remains available so
+		// integrations can override the default explicitly.
+		if ( '' === $model_slug ) {
+			$model_slug = self::normalize_requested_model_slug( apply_filters(
+				'slytranslate_default_model_slug',
+				self::resolve_first_available_model_slug()
+			) );
+		}
+
+		if ( is_string( self::$model_slug_override ) && '' !== self::$model_slug_override ) {
+			$model_slug = self::$model_slug_override;
+		}
+
+		self::$context = array(
+			'service_slug'   => '',
+			'model_slug'     => $model_slug,
+			'direct_api_url' => $direct_api_url,
+		);
+
+		return self::$context;
+	}
+
+	/**
+	 * Return the first model id the WP AI Client registry currently exposes
+	 * for text-generation requests, or '' if discovery is not possible. This
+	 * mirrors what `wp_ai_client_prompt()->generate_text()` would internally
+	 * route to when no explicit model preference is provided, so it is the
+	 * closest thing the WP AI Client offers to a "connector default model".
+	 */
+	private static function resolve_first_available_model_slug(): string {
+		if ( ! class_exists( '\\WordPress\\AiClient\\AiClient' )
+			|| ! class_exists( '\\WordPress\\AiClient\\Providers\\Models\\DTO\\ModelRequirements' ) ) {
+			return '';
+		}
+
+		try {
+			$registry         = \WordPress\AiClient\AiClient::defaultRegistry();
+			$requirements     = new \WordPress\AiClient\Providers\Models\DTO\ModelRequirements( array(), array() );
+			$provider_results = $registry->findModelsMetadataForSupport( $requirements );
+		} catch ( \Throwable $e ) {
+			return '';
+		}
+
+		foreach ( $provider_results as $provider_models ) {
+			foreach ( $provider_models->getModels() as $model_meta ) {
+				$id = (string) $model_meta->getId();
+				if ( '' !== $id ) {
+					return $id;
+				}
+			}
+		}
+
+		return '';
+	}
+
+	public static function reset_context(): void {
+		self::$context              = null;
+		self::$chunk_char_limit_cache = null;
+		self::$model_profile_cache    = array();
+		self::$wp_ai_client_kwargs_support_cache = array();
+	}
+
+	public static function get_requested_model_slug(): string {
+		if ( is_string( self::$model_slug_override ) && '' !== self::$model_slug_override ) {
+			return self::$model_slug_override;
+		}
+
+		$runtime_context = self::get_runtime_context();
+		return (string) ( $runtime_context['model_slug'] ?? '' );
+	}
+
+	private static function get_runtime_context_cache_key(): string {
+		$runtime_context = self::get_runtime_context();
+		return '' === $runtime_context['model_slug'] ? '' : $runtime_context['model_slug'];
+	}
+
+	public static function get_learned_context_window_tokens(): int {
+		$cache_key = self::get_runtime_context_cache_key();
+		if ( '' === $cache_key ) {
+			return 0;
+		}
+
+		$learned = get_option( 'slytranslate_learned_context_windows', array() );
+		if ( ! is_array( $learned ) ) {
+			return 0;
+		}
+
+		if ( isset( $learned[ $cache_key ] ) ) {
+			return absint( $learned[ $cache_key ] );
+		}
+
+		// Fall back to a case-insensitive lookup so values discovered via
+		// `GET /v1/models` (stored lower-cased by
+		// ConfigurationService::probe_direct_api_context_windows()) are
+		// still found when the configured model slug uses mixed case.
+		$lower = strtolower( $cache_key );
+		if ( isset( $learned[ $lower ] ) ) {
+			return absint( $learned[ $lower ] );
+		}
+
+		return 0;
+	}
+
+	private static function remember_context_window_tokens( int $context_window_tokens ): void {
+		$cache_key = self::get_runtime_context_cache_key();
+		if ( '' === $cache_key ) {
+			return;
+		}
+
+		$context_window_tokens = absint( $context_window_tokens );
+		if ( $context_window_tokens < self::MIN_CONTEXT_WINDOW_TOKENS ) {
+			return;
+		}
+
+		$learned = get_option( 'slytranslate_learned_context_windows', array() );
+		if ( ! is_array( $learned ) ) {
+			$learned = array();
+		}
+		$learned[ $cache_key ] = $context_window_tokens;
+		update_option( 'slytranslate_learned_context_windows', $learned, false );
+	}
+
+	public static function get_known_context_window_for_model( string $model_slug ): int {
+		if ( '' === $model_slug ) {
+			return 0;
+		}
+
+		$model_slug = strtolower( $model_slug );
+		foreach ( self::KNOWN_MODEL_CONTEXT_WINDOWS as $needle => $tokens ) {
+			if ( false !== strpos( $model_slug, $needle ) ) {
+				return $tokens;
+			}
+		}
+
+		return 0;
+	}
+
+	public static function maybe_adjust_chunk_limit_from_error( \WP_Error $error, int $chunk_char_limit ): int {
+		$context_window_tokens = self::extract_context_window_tokens_from_error( $error );
+		if ( $context_window_tokens > 0 ) {
+			self::remember_context_window_tokens( $context_window_tokens );
+
+			$adjusted = self::get_chunk_char_limit_from_context_window( $context_window_tokens );
+			if ( $adjusted >= $chunk_char_limit ) {
+				$adjusted = (int) floor( $chunk_char_limit / 2 );
+			}
+
+			$adjusted = max( self::MIN_TRANSLATION_CHARS, min( $chunk_char_limit - 1, $adjusted ) );
+
+			return $adjusted >= $chunk_char_limit ? 0 : $adjusted;
+		}
+
+		// Some connectors hard-timeout around 30s and return transport errors
+		// (often cURL error 28) for large prompts. Shrink chunk size and retry.
+		if ( ! self::is_timeout_transport_error( $error ) ) {
+			return 0;
+		}
+
+		$adjusted = (int) floor( $chunk_char_limit * 0.6 );
+		$adjusted = max( self::TIMEOUT_RETRY_MIN_CHARS, min( $chunk_char_limit - 1, $adjusted ) );
+
+		return $adjusted >= $chunk_char_limit ? 0 : $adjusted;
+	}
+
+	private static function is_timeout_transport_error( \WP_Error $error ): bool {
+		foreach ( $error->get_error_messages() as $message ) {
+			if ( preg_match( '/cURL\s+error\s+28|timed?\s+out|timeout/i', (string) $message ) ) {
+				return true;
+			}
+		}
+
+		return false;
+	}
+
+	public static function extract_context_window_tokens_from_error( \WP_Error $error ): int {
+		foreach ( $error->get_error_messages() as $message ) {
+			if ( preg_match( '/context size \((\d+) tokens\)|maximum context length is (\d+) tokens|context window(?: of)? (\d+) tokens/i', $message, $matches ) ) {
+				foreach ( array_slice( $matches, 1 ) as $match ) {
+					$tokens = absint( $match );
+					if ( $tokens > 0 ) {
+						return $tokens;
+					}
+				}
+			}
+		}
+		return 0;
+	}
+
+	/* ---------------------------------------------------------------
+	 * Model / direct-API detection
+	 * ------------------------------------------------------------- */
+
+	public static function model_requires_strict_direct_api( string $model_slug ): bool {
+		if ( '' === trim( $model_slug ) ) {
+			return false;
+		}
+
+		$model_profile = self::get_model_profile( $model_slug );
+
+		return ! empty( $model_profile['requires_strict_direct_api'] );
+	}
+
+	/**
+	 * Returns true when the direct API should be used for the given model
+	 * and endpoint URL.
+	 *
+	 * Default transport is the WordPress AI Client. Direct API is reserved
+	 * for strict model profiles that explicitly require it (for example
+	 * TranslateGemma with chat_template_kwargs requirements).
+	 *
+	 * Legacy `ai_translate_force_direct_api` values are intentionally ignored
+	 * here so normal models cannot be globally switched away from the
+	 * connector-managed WP AI Client transport.
+	 */
+	private static function should_use_direct_api( string $model_slug, string $direct_api_url ): bool {
+		if ( '' === $direct_api_url ) {
+			return false;
+		}
+		return self::model_requires_strict_direct_api( $model_slug );
+	}
+
+	public static function direct_api_kwargs_supported(): bool {
+		return get_option( 'slytranslate_direct_api_kwargs_detected', '0' ) === '1';
+	}
+
+	public static function refresh_direct_api_kwargs_detection( string $api_url, string $model_slug ): bool {
+		$probe_result = ConfigurationService::probe_direct_api_kwargs( $api_url, $model_slug );
+		update_option( 'slytranslate_direct_api_kwargs_detected', $probe_result ? '1' : '0' );
+		update_option( 'slytranslate_direct_api_kwargs_last_probed_at', time(), false );
+		return $probe_result;
+	}
+
+	public static function get_translategemma_runtime_status(): array {
+		$runtime_context = self::get_runtime_context();
+		$model_slug      = self::$model_slug_override ?? $runtime_context['model_slug'];
+
+		if ( ! self::model_requires_strict_direct_api( $model_slug ) ) {
+			return array( 'ready' => true, 'status' => 'not-selected' );
+		}
+
+		if ( '' === $runtime_context['direct_api_url'] ) {
+			return array( 'ready' => false, 'status' => 'direct-api-required' );
+		}
+
+		if ( ! self::direct_api_kwargs_supported() ) {
+			return array( 'ready' => false, 'status' => 'kwargs-required' );
+		}
+
+		return array( 'ready' => true, 'status' => 'ready' );
+	}
+
+	/* ---------------------------------------------------------------
+	 * Diagnostics
+	 * ------------------------------------------------------------- */
+
+	public static function record_transport_diagnostics( array $diagnostics ): void {
+		$defaults = array(
+			'transport'            => '',
+			'model_slug'           => '',
+			'requested_model_slug' => '',
+			'effective_model_slug' => '',
+			'direct_api_url'       => '',
+			'kwargs_supported'     => false,
+			'fallback_allowed'     => true,
+			'failure_reason'       => '',
+			'error_code'           => '',
+			'error_message'        => '',
+		);
+
+		$diagnostics = array_merge( $defaults, $diagnostics );
+
+		if ( '' === $diagnostics['model_slug'] ) {
+			$diagnostics['model_slug'] = (string) ( $diagnostics['requested_model_slug'] ?: $diagnostics['effective_model_slug'] );
+		}
+
+		if ( '' === $diagnostics['requested_model_slug'] ) {
+			$diagnostics['requested_model_slug'] = (string) $diagnostics['model_slug'];
+		}
+
+		if ( '' === $diagnostics['effective_model_slug'] ) {
+			$diagnostics['effective_model_slug'] = (string) $diagnostics['model_slug'];
+		}
+
+		self::$last_diagnostics = $diagnostics;
+	}
+
+	public static function get_last_diagnostics(): ?array {
+		return self::$last_diagnostics;
+	}
+
+	public static function get_last_diagnostics_snapshot(): array {
+		return is_array( self::$last_diagnostics ) ? self::$last_diagnostics : array(
+			'transport'            => '',
+			'model_slug'           => '',
+			'requested_model_slug' => '',
+			'effective_model_slug' => '',
+			'direct_api_url'       => '',
+			'kwargs_supported'     => false,
+			'fallback_allowed'     => true,
+			'failure_reason'       => '',
+			'error_code'           => '',
+			'error_message'        => '',
+		);
+	}
+
+	public static function get_source_lang(): ?string {
+		return self::$source_lang;
+	}
+
+	public static function get_target_lang(): ?string {
+		return self::$target_lang;
+	}
+
+	private static function record_validation_failure_diagnostics( \WP_Error $error ): void {
+		$diagnostics = is_array( self::$last_diagnostics )
+			? self::$last_diagnostics
+			: array(
+				'transport'            => 'unknown',
+				'model_slug'           => '',
+				'requested_model_slug' => '',
+				'effective_model_slug' => '',
+				'direct_api_url'       => '',
+				'kwargs_supported'     => false,
+				'fallback_allowed'     => true,
+				'error_code'           => '',
+				'error_message'        => '',
+			);
+
+		$diagnostics['failure_reason'] = $error->get_error_code();
+		$diagnostics['error_code']     = $error->get_error_code();
+		$diagnostics['error_message']  = $error->get_error_message();
+		self::record_transport_diagnostics( $diagnostics );
+	}
+
+	/* ---------------------------------------------------------------
+	 * Retry / validation helpers
+	 * ------------------------------------------------------------- */
+
+	private static function should_retry_after_validation_failure( string $model_slug, string $validation_error_code ): bool {
+		$model_profile = self::get_model_profile( $model_slug );
+		$retry_profile = is_array( $model_profile['retry_profile'] ?? null ) ? $model_profile['retry_profile'] : array();
+
+		if ( empty( $retry_profile['retry_on_validation_failure'] ) ) {
+			return false;
+		}
+
+		if ( 'invalid_translation_language_passthrough' === $validation_error_code ) {
+			return ! empty( $retry_profile['retry_on_passthrough_de'] );
+		}
+
+		return true;
+	}
+
+	private static function get_retry_chunk_limit_for_validation_failure( string $model_slug, string $validation_error_code ): int {
+		$model_profile = self::get_model_profile( $model_slug );
+		$retry_profile = is_array( $model_profile['retry_profile'] ?? null ) ? $model_profile['retry_profile'] : array();
+
+		if ( empty( $retry_profile['reduce_chunk_on_retry'] ) ) {
+			return 0;
+		}
+
+		if ( 'invalid_translation_language_passthrough' === $validation_error_code && empty( $retry_profile['retry_on_passthrough_de'] ) ) {
+			return 0;
+		}
+
+		$retry_chunk_chars = absint( $retry_profile['retry_chunk_chars'] ?? 0 );
+		if ( $retry_chunk_chars < self::MIN_TRANSLATION_CHARS ) {
+			$retry_chunk_chars = (int) floor( self::get_chunk_char_limit() * 0.5 );
+		}
+
+		return max( self::MIN_TRANSLATION_CHARS, min( self::MAX_TRANSLATION_CHARS, $retry_chunk_chars ) );
+	}
+
+	/**
+	 * Compute a conservative max-output-token budget for a single chunk.
+	 *
+	 * Translations rarely exceed ~2x the source length, so we cap output
+	 * generation at roughly 2x the input token estimate (4 chars/token).
+	 * This is the primary safeguard against runaway generation that was
+	 * observed live: 763 input chars producing 23.000 output chars.
+	 *
+	 * The ceiling (`MAX_OUTPUT_TOKENS_CEILING`) scales with
+	 * `MAX_TRANSLATION_CHARS` so a chunk that fills the char ceiling is
+	 * still allowed to emit a same-size translation instead of being
+	 * truncated mid-sentence (which previously surfaced as a
+	 * length-drift validator failure). Operators can tune both the
+	 * floor and the ceiling via the `ai_translate_max_output_tokens`
+	 * and `ai_translate_max_output_tokens_ceiling` filters.
+	 *
+	 * Public for unit testing.
+	 */
+	public static function compute_max_output_tokens( int $input_chars ): int {
+		// 4 chars/token average × 2x growth headroom = input_chars * 0.5 tokens.
+		$tokens = (int) ceil( max( 1, $input_chars ) * 0.5 );
+
+		$ceiling = (int) apply_filters( 'slytranslate_max_output_tokens_ceiling', self::MAX_OUTPUT_TOKENS_CEILING, $input_chars );
+		if ( $ceiling < self::MIN_OUTPUT_TOKENS ) {
+			$ceiling = self::MAX_OUTPUT_TOKENS_CEILING;
+		}
+
+		$computed = (int) min( $ceiling, max( self::MIN_OUTPUT_TOKENS, $tokens ) );
+
+		$filtered = (int) apply_filters( 'slytranslate_max_output_tokens', $computed, $input_chars, $ceiling );
+		if ( $filtered < self::MIN_OUTPUT_TOKENS ) {
+			return $computed;
+		}
+
+		return (int) min( $ceiling, $filtered );
+	}
+
+	/**
+	 * Validation error codes that should trigger an automatic retry even
+	 * when the first attempt already used the standard prompt.
+	 */
+	public static function is_retryable_validation_error_code( string $code ): bool {
+		return in_array(
+			$code,
+			array(
+				'invalid_translation_assistant_reply',
+				'invalid_translation_length_drift',
+				'invalid_translation_runaway_output',
+				'invalid_translation_structure_drift',
+				'invalid_translation_empty',
+				'invalid_translation_plain_text_missing',
+				'invalid_translation_language_passthrough',
+			),
+			true
+		);
+	}
+
+	private static function build_retry_prompt( string $prompt, string $model_slug = '', string $validation_error_code = '' ): string {
+		$retry_prompt = $prompt . "\n\nCRITICAL: Return only the translated content. Preserve HTML tags, Gutenberg block comments, URLs, code fences, and source symbols exactly. Do not rewrite Unicode symbols or math notation as LaTeX or ASCII. Do not add explanations, bullet lists, markdown headings, or commentary. The output length MUST be approximately the same as the input length; do not append extra paragraphs.";
+		$uses_bilingual_prompt_style = self::PROMPT_STYLE_BILINGUAL_FRAME === self::get_prompt_style_for_model( $model_slug );
+
+		if ( $uses_bilingual_prompt_style ) {
+			$retry_prompt .= "\n\n" . sprintf( 'CRITICAL OUTPUT FORMAT: Return only the translation enclosed in %1$s and %2$s. Do not output anything before or after these tags.', self::OUTPUT_WRAPPER_OPEN, self::OUTPUT_WRAPPER_CLOSE );
+		}
+
+		if ( $uses_bilingual_prompt_style || 'invalid_translation_language_passthrough' === $validation_error_code ) {
+			$target_label = self::resolve_language_label( is_string( self::$target_lang ) ? self::$target_lang : null, 'the target language' );
+			$retry_prompt .= "\n\nCRITICAL: The final output must be in {$target_label}. Do not keep source-language sentences unchanged.";
+		}
+
+		if ( '' !== trim( $prompt ) ) {
+			$retry_prompt .= "\n\nCRITICAL: Keep obeying the user-provided translation rules above.";
+		}
+
+		return $retry_prompt;
+	}
+
+	private static function extract_bilingual_frame_translation( string $translated_text ): string {
+		$trimmed = trim( $translated_text );
+		if ( '' === $trimmed ) {
+			return $translated_text;
+		}
+
+		$wrapped_pattern = '/' . preg_quote( self::OUTPUT_WRAPPER_OPEN, '/' ) . '(.*?)' . preg_quote( self::OUTPUT_WRAPPER_CLOSE, '/' ) . '/is';
+		if ( 1 === preg_match( $wrapped_pattern, $trimmed, $matches ) && isset( $matches[1] ) && is_string( $matches[1] ) ) {
+			$candidate = trim( $matches[1] );
+			if ( '' !== $candidate ) {
+				return $candidate;
+			}
+		}
+
+		$target_label = self::resolve_language_label( is_string( self::$target_lang ) ? self::$target_lang : null, '' );
+		if ( '' === $target_label ) {
+			return $translated_text;
+		}
+
+		$label_pattern = '/(?:^|\R)\s*(?:\*\*)?'
+			. preg_quote( $target_label, '/' )
+			. '\s*:\s*(?:\*\*)?\s*/iu';
+
+		if ( 1 !== preg_match_all( $label_pattern, $trimmed, $label_matches, PREG_OFFSET_CAPTURE )
+			|| empty( $label_matches[0] )
+		) {
+			return $translated_text;
+		}
+
+		$last_label = end( $label_matches[0] );
+		if ( ! is_array( $last_label ) || ! isset( $last_label[0], $last_label[1] ) ) {
+			return $translated_text;
+		}
+
+		$offset = (int) $last_label[1] + strlen( (string) $last_label[0] );
+		if ( $offset >= strlen( $trimmed ) ) {
+			return $translated_text;
+		}
+
+		$candidate = trim( substr( $trimmed, $offset ) );
+		if ( '' === $candidate ) {
+			return $translated_text;
+		}
+
+		$tail_parts = preg_split( '/\R\s*(?:notes?|explanation|reasoning|analysis|source|english)\s*:\s*/iu', $candidate, 2 );
+		if ( is_array( $tail_parts ) && isset( $tail_parts[0] ) && is_string( $tail_parts[0] ) ) {
+			$candidate = trim( $tail_parts[0] );
+		}
+
+		return '' !== $candidate ? $candidate : $translated_text;
+	}
+
+	/* ---------------------------------------------------------------
+	 * Rate-limit (HTTP 429) handling
+	 * ------------------------------------------------------------- */
+
+	/**
+	 * Decide whether the given transport result looks like a provider-side
+	 * rate-limit response (HTTP 429 / "too many requests" / "rate limit reached").
+	 * Works for both the WP AI Client `WP_Error` path (Groq / OpenAI / Anthropic
+	 * surface the message verbatim) and the direct-API `non_2xx_or_empty` path
+	 * when a 429 body is logged by the caller.
+	 */
+	public static function is_rate_limit_error( \WP_Error $error ): bool {
+		foreach ( self::get_transport_error_fragments( $error ) as $fragment ) {
+			if ( false !== stripos( $fragment, 'temporarily rate-limited upstream' ) ) {
+				return true;
+			}
+
+			if ( false !== stripos( $fragment, 'too many requests' )
+				|| false !== stripos( $fragment, 'rate limit' )
+				|| false !== stripos( $fragment, 'model limit reached' )
+				|| false !== stripos( $fragment, 'try again later' )
+			) {
+				return true;
+			}
+
+			if ( preg_match( '/(?:^|[^0-9])429(?:[^0-9]|$)/', $fragment ) ) {
+				return true;
+			}
+		}
+
+		return false;
+	}
+
+	/**
+	 * Normalize connector transport errors when an upstream provider hides the
+	 * actual rate-limit details inside nested response payloads.
+	 */
+	private static function normalize_transport_error( \WP_Error $error, string $model_slug ): \WP_Error {
+		if ( self::is_rate_limit_error( $error ) ) {
+			$message = self::extract_rate_limit_error_message( $error, $model_slug );
+			if ( '' === $message || $message === $error->get_error_message() ) {
+				return $error;
+			}
+
+			return self::clone_transport_error_with_message( $error, 'translation_provider_rate_limited', $message );
+		}
+
+		$message = self::extract_specific_transport_error_message( $error, $model_slug );
+		if ( '' === $message || $message === $error->get_error_message() ) {
+			return $error;
+		}
+
+		return self::clone_transport_error_with_message( $error, (string) $error->get_error_code(), $message );
+	}
+
+	private static function clone_transport_error_with_message( \WP_Error $error, string $code, string $message ): \WP_Error {
+		$resolved_code = '' !== trim( $code ) ? $code : (string) $error->get_error_code();
+		$error_data    = method_exists( $error, 'get_error_data' )
+			? $error->get_error_data( (string) $error->get_error_code() )
+			: null;
+
+		if ( null !== $error_data ) {
+			return new \WP_Error( $resolved_code, $message, $error_data );
+		}
+
+		return new \WP_Error( $resolved_code, $message );
+	}
+
+	/**
+	 * Flatten codes, messages, and nested error-data payloads into strings that
+	 * can be inspected for provider-specific transport hints.
+	 *
+	 * @return string[]
+	 */
+	private static function get_transport_error_fragments( \WP_Error $error ): array {
+		$fragments = array();
+		$codes     = $error->get_error_codes();
+
+		foreach ( $codes as $code ) {
+			if ( is_string( $code ) && '' !== trim( $code ) ) {
+				$fragments[] = trim( $code );
+			}
+
+			foreach ( $error->get_error_messages( $code ) as $message ) {
+				self::append_transport_error_fragments_from_value( $message, $fragments );
+			}
+
+			if ( method_exists( $error, 'get_error_data' ) ) {
+				self::append_transport_error_fragments_from_value( $error->get_error_data( $code ), $fragments );
+			}
+
+			if ( method_exists( $error, 'get_all_error_data' ) ) {
+				self::append_transport_error_fragments_from_value( $error->get_all_error_data( $code ), $fragments );
+			}
+		}
+
+		if ( empty( $codes ) ) {
+			foreach ( $error->get_error_messages() as $message ) {
+				self::append_transport_error_fragments_from_value( $message, $fragments );
+			}
+
+			if ( method_exists( $error, 'get_error_data' ) ) {
+				self::append_transport_error_fragments_from_value( $error->get_error_data(), $fragments );
+			}
+		}
+
+		$fragments = array_values(
+			array_unique(
+				array_filter(
+					array_map( 'trim', $fragments ),
+					static fn( $fragment ): bool => is_string( $fragment ) && '' !== $fragment
+				)
+			)
+		);
+
+		return $fragments;
+	}
+
+	/**
+	 * @param array<int,string> $fragments
+	 */
+	private static function append_transport_error_fragments_from_value( mixed $value, array &$fragments, int $depth = 0 ): void {
+		if ( $depth > 6 || null === $value ) {
+			return;
+		}
+
+		if ( is_string( $value ) ) {
+			if ( '' !== trim( $value ) ) {
+				$fragments[] = $value;
+			}
+
+			$decoded = json_decode( $value, true );
+			if ( is_array( $decoded ) ) {
+				self::append_transport_error_fragments_from_value( $decoded, $fragments, $depth + 1 );
+			}
+
+			return;
+		}
+
+		if ( is_scalar( $value ) ) {
+			$fragments[] = (string) $value;
+			return;
+		}
+
+		if ( is_array( $value ) ) {
+			foreach ( $value as $inner_value ) {
+				self::append_transport_error_fragments_from_value( $inner_value, $fragments, $depth + 1 );
+			}
+			return;
+		}
+
+		if ( is_object( $value ) ) {
+			foreach ( get_object_vars( $value ) as $inner_value ) {
+				self::append_transport_error_fragments_from_value( $inner_value, $fragments, $depth + 1 );
+			}
+		}
+	}
+
+	private static function extract_rate_limit_error_message( \WP_Error $error, string $model_slug ): string {
+		$fragments = self::get_transport_error_fragments( $error );
+
+		foreach ( $fragments as $fragment ) {
+			if ( false !== stripos( $fragment, 'temporarily rate-limited upstream' ) ) {
+				return $fragment;
+			}
+		}
+
+		foreach ( $fragments as $fragment ) {
+			if ( false !== stripos( $fragment, 'too many requests' )
+				|| false !== stripos( $fragment, 'rate limit' )
+				|| false !== stripos( $fragment, 'model limit reached' )
+				|| false !== stripos( $fragment, 'try again later' )
+			) {
+				return $fragment;
+			}
+		}
+
+		return sprintf(
+			/* translators: %s: model slug. */
+			__( 'The translation provider temporarily rate-limited model "%s". Please retry shortly or switch to another model.', 'slytranslate' ),
+			'' !== $model_slug ? $model_slug : 'unknown'
+		);
+	}
+
+	private static function extract_specific_transport_error_message( \WP_Error $error, string $model_slug ): string {
+		$original_message = trim( (string) $error->get_error_message() );
+		$fragments        = self::get_transport_error_fragments( $error );
+		$candidates       = array();
+
+		foreach ( $fragments as $fragment ) {
+			if ( ! self::is_specific_transport_error_fragment( $fragment, $original_message, $model_slug ) ) {
+				continue;
+			}
+
+			$candidates[] = $fragment;
+		}
+
+		if ( ! empty( $candidates ) ) {
+			usort(
+				$candidates,
+				static fn( string $left, string $right ): int => strlen( $right ) <=> strlen( $left )
+			);
+
+			return trim( (string) $candidates[0] );
+		}
+
+		if ( self::looks_like_generic_connector_error_message( $original_message ) ) {
+			return sprintf(
+				/* translators: %s: model slug. */
+				__( 'The translation provider returned an upstream error for model "%s". No detailed provider message was exposed by the connector.', 'slytranslate' ),
+				'' !== $model_slug ? $model_slug : 'unknown'
+			);
+		}
+
+		return '';
+	}
+
+	private static function is_specific_transport_error_fragment( string $fragment, string $original_message, string $model_slug ): bool {
+		$fragment = trim( $fragment );
+		if ( '' === $fragment ) {
+			return false;
+		}
+
+		$normalized_fragment = strtolower( $fragment );
+		$normalized_original = strtolower( trim( $original_message ) );
+		$normalized_model    = strtolower( trim( $model_slug ) );
+
+		if ( '' !== $normalized_original && $normalized_fragment === $normalized_original ) {
+			return false;
+		}
+
+		if ( '' !== $normalized_model && $normalized_fragment === $normalized_model ) {
+			return false;
+		}
+
+		if ( preg_match( '/^\d{3}$/', $fragment ) ) {
+			return false;
+		}
+
+		if ( preg_match( '/^(?:error|message|metadata|raw|body|code|status)$/i', $fragment ) ) {
+			return false;
+		}
+
+		if ( false === preg_match( '/\s/u', $fragment ) && false !== strpos( $fragment, '/' ) ) {
+			return false;
+		}
+
+		if ( filter_var( $fragment, FILTER_VALIDATE_URL ) ) {
+			return false;
+		}
+
+		if ( self::looks_like_generic_connector_error_message( $fragment ) ) {
+			return false;
+		}
+
+		return strlen( $fragment ) >= 16 && 1 === preg_match( '/\s/u', $fragment );
+	}
+
+	private static function looks_like_generic_connector_error_message( string $message ): bool {
+		$normalized = strtolower( trim( $message ) );
+		if ( '' === $normalized ) {
+			return false;
+		}
+
+		$generic_markers = array(
+			'bad gateway (502) - provider returned error',
+			'provider returned error',
+			'upstream server error',
+			'prompt_upstream_server_error',
+			'http_bad_gateway',
+		);
+
+		foreach ( $generic_markers as $marker ) {
+			if ( false !== strpos( $normalized, $marker ) ) {
+				return true;
+			}
+		}
+
+		return false;
+	}
+
+	/**
+	 * Extract the retry-after hint (in seconds) from a 429 error, looking at:
+	 *
+	 *   - "Please try again in 2s" / "try again in 2.5s" / "try again in 1m30s"
+	 *     (Groq / OpenAI-style messages)
+	 *   - "Retry-After: N" header echoed into the message body
+	 *
+	 * Falls back to `$default_seconds` when nothing could be parsed. Always
+	 * clamped to the [RATE_LIMIT_MIN_SLEEP_SEC, RATE_LIMIT_MAX_SLEEP_SEC]
+	 * range so a misbehaving provider cannot stall a request indefinitely.
+	 */
+	public static function extract_retry_after_seconds( \WP_Error $error, float $default_seconds = 2.0 ): float {
+		$seconds = 0.0;
+		foreach ( self::get_transport_error_fragments( $error ) as $message ) {
+
+			// "try again in 1m30s", "try again in 30s", "try again in 2.5s".
+			if ( preg_match( '/try again in\s+(?:(\d+)m)?(\d+(?:\.\d+)?)s/i', $message, $m ) ) {
+				$seconds = ( (int) ( $m[1] ?? 0 ) ) * 60.0 + (float) $m[2];
+				break;
+			}
+
+			// "Retry-After: 2" (header-style, integer seconds).
+			if ( preg_match( '/retry-?after["\s:]+(\d+(?:\.\d+)?)/i', $message, $m ) ) {
+				$seconds = (float) $m[1];
+				break;
+			}
+		}
+
+		if ( $seconds <= 0.0 ) {
+			$seconds = $default_seconds;
+		}
+
+		// Add a small jitter so multiple parallel requests do not all wake
+		// up in the same millisecond and re-trigger the limit in lockstep.
+		$seconds += ( wp_rand( 0, 500 ) / 1000.0 );
+
+		$seconds = max( (float) self::RATE_LIMIT_MIN_SLEEP_SEC, $seconds );
+		$seconds = min( (float) self::RATE_LIMIT_MAX_SLEEP_SEC, $seconds );
+
+		return $seconds;
+	}
+
+	/**
+	 * Sleep for the interval the provider suggested, then re-run
+	 * `translate_chunk()` in place. Used by the transport-level 429 guard.
+	 * Returns the error unchanged when the retry budget is exhausted so the
+	 * caller's existing error path (validation retry / content-phase
+	 * fallback cascade) can handle it.
+	 */
+	private static function handle_rate_limit_and_retry(
+		\WP_Error $error,
+		string $text,
+		string $prompt,
+		int $validation_attempt,
+		string $model_slug,
+		bool $skip_validation = false
+	): mixed {
+		if ( self::$rate_limit_retry_depth >= self::RATE_LIMIT_MAX_RETRIES ) {
+			TimingLogger::log( 'ai_rate_limit_exhausted', array(
+				'model'   => $model_slug,
+				'retries' => self::$rate_limit_retry_depth,
+				'reason'  => $error->get_error_code(),
+			) );
+			return $error;
+		}
+
+		$sleep_seconds = self::extract_retry_after_seconds( $error );
+
+		self::$rate_limit_retry_depth++;
+		TimingLogger::log( 'ai_rate_limit_wait', array(
+			'model'         => $model_slug,
+			'attempt'       => self::$rate_limit_retry_depth,
+			'sleep_ms'      => (int) round( $sleep_seconds * 1000 ),
+			'retry_budget'  => self::RATE_LIMIT_MAX_RETRIES,
+		) );
+
+		// `usleep()` takes microseconds; `sleep()` only whole seconds. Use
+		// usleep so sub-second hints like "try again in 0.8s" are respected.
+		usleep( (int) round( $sleep_seconds * 1_000_000 ) );
+
+		try {
+			return self::translate_chunk( $text, $prompt, $validation_attempt, $skip_validation );
+		} finally {
+			self::$rate_limit_retry_depth--;
+		}
+	}
+}
