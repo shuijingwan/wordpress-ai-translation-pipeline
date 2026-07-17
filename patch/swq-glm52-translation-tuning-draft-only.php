@@ -2177,45 +2177,43 @@ final class SWQ_GLM52_Translation_Tuning {
 	private static function build_content_prompt( string $target_language ): string {
 		$language_rules = self::build_target_language_content_rules( $target_language );
 
-		return "FULL-ARTICLE TRANSLATION MODE:\n\n"
-			. "The input is the complete body of one technical article. Translate it as one coherent, publication-ready document into the requested target language.\n\n"
-			. "Determine the article's actual technical field from its content. Do not assume that every article is about WordPress, PHP, Nginx, servers, or any other fixed technology.\n\n"
+		return "全文翻译模式：\n\n"
+			. "输入内容是一篇技术文章的完整正文。请将它作为一个连贯、可直接发布的完整文档翻译成目标语言。\n\n"
+			. "请根据文章内容判断其实际技术领域，不要预设每篇文章都与 WordPress、PHP、Nginx、服务器或任何其他固定技术有关。\n\n"
 			. $language_rules
 			. "\n\n"
 			. <<<'PROMPT'
-The article title and summary above are context only. Do not include them in the returned body.
+上方提供的文章标题和摘要只用于理解上下文，不得将它们加入返回的正文。
 
-Non-translatable code, inline code, fixed HTML elements, Gutenberg block boundaries and selected translatable regions have been replaced with protected tokens.
+不可翻译的代码、行内代码、固定 HTML 元素、Gutenberg 区块边界以及部分可翻译区域已替换为受保护占位符。
 
-A token beginning with SWQBLOCK represents a complete standalone non-translatable code block or code element. Copy every SWQBLOCK token byte-for-byte, exactly once. Treat every SWQBLOCK token as an immovable document anchor: keep all SWQBLOCK tokens in their original relative order and original document position. Never reverse, swap or regroup two SWQBLOCK tokens merely to produce smoother target-language syntax. Rewrite only the natural-language text before, between and after the fixed tokens so that the target-language sentence remains accurate while the token order stays unchanged. For example, when the source structure is 'in the property: SWQBLOCK000001END ... submit: SWQBLOCK000002END', keep token 000001 before token 000002; do not rewrite it as 'submit SWQBLOCK000002END to the property SWQBLOCK000001END'. Before returning the article, perform a final check that the SWQBLOCK sequence is identical to the input sequence.
+每个受保护占位符都必须逐字符原样复制，并且在输出中必须且只能出现一次。不得遗漏、重复、额外生成、复制、翻译、改名、拆开、包裹或重新编号任何占位符，也不得把一个段落中的占位符复制到另一个段落。占位符的类型、大小写和结尾必须保持不变；编号必须始终是固定 6 位数字，所有前导零都必须保留。
 
-A token beginning with SWQINLINE represents inline code inside natural-language text. Copy every SWQINLINE token byte-for-byte and exactly once. An SWQINLINE token may move only within the same sentence when required by natural word order; never move it to another paragraph, list item, heading, table cell or section.
+例如，SWQSTRUCT000018END、SWQBLOCK000018END、SWQINLINE000018END 和 SWQHTML000018END 必须完整保留。SWQSTRUCT000018END 不得写成 SWQSTRUCT00018END、SWQSTRUCT000018end、SWQSTRUCT 000018 END 或 SWQSTRUCT000 018END。不得在占位符内部插入空格、换行、标点、HTML 标签或 Markdown 格式。
 
-A token beginning with SWQHTML represents a fixed HTML element. Copy it byte-for-byte, exactly once, without moving it.
+SWQBLOCK 开头的占位符代表一个完整、独立且不可翻译的代码块或代码元素。把每个 SWQBLOCK 当作不可移动的文档锚点，保持它们原有的相对顺序和文档位置。不得为了让目标语言更流畅而反转、交换或重新组合两个 SWQBLOCK；只能改写固定 Token 前、后或之间的自然语言，同时保持 Token 顺序不变。例如原文结构是“属性中：SWQBLOCK000001END……提交：SWQBLOCK000002END”时，必须保持 000001 在 000002 之前。
 
-A token beginning with SWQSTRUCT represents an original Gutenberg opening or closing block comment. Treat every SWQSTRUCT token as an immovable block boundary. Copy it byte-for-byte, exactly once, preserve the complete SWQSTRUCT sequence, and never delete a block boundary or merge the text from two blocks into one block. Even when two adjacent source paragraphs would form a smoother target-language sentence if combined, keep both block boundaries and express the meaning within the original blocks.
+SWQINLINE 开头的占位符代表自然语言中的行内代码。每个 SWQINLINE 只能在其原句或原段落内部因英文语序需要而调整位置，不得移动到其他段落、列表项、标题、表格单元格或章节，也不得把前一段的 SWQINLINE 复制到后一段。
 
-Text between a matching SWQPLAINSTART token and SWQPLAINSTOP token comes from a Plaintext or preformatted block. The default rule is to translate every human-language fragment in these regions. Translate author-written labels, annotations, summaries, instructions and descriptions even when they are short, appear alone on one line, resemble terminal output, or are mixed with URLs, domains and identifiers. Preserve the machine value but translate the human explanation around it. For example, translate 中文站： and 英文站： as Chinese site: and English site:, translate 选择 Browser as Select Browser, and translate the explanatory part of www.example.com：补丁正常输出 while preserving the domain exactly. Preserve source-language wording only when the surrounding article explicitly identifies that exact wording itself as evidence from the real system and changing it would make the example factually inaccurate. This narrow exception may apply to an exact interface label, raw error message, raw log entry or literal observed value. For example, preserve 中文（中国） when the surrounding prose explains that it is the exact language-switcher label displayed on the Chinese site. Merely being inside a Plaintext block, looking like output, or being a short label is not enough reason to preserve it. When the role of a natural-language fragment remains ambiguous, translate it. A Plaintext region that contains only URLs, domains, paths, commands, identifiers, status codes or other machine-readable values is exposed so you can understand the surrounding sentence; copy that region's inner text exactly and do not relocate the region. Always preserve URLs, domains, paths, commands, parameters, machine identifiers, status codes, arrows, punctuation, line order, line count, blank lines and indentation. Do not add Markdown fences or surrounding quotation marks.
+SWQHTML 开头的占位符代表固定 HTML 元素，必须逐字符原样保留一次，且不得移动。
 
-Text between a matching SWQALTSTART token and SWQALTSTOP token is an image alt value. Translate it naturally and concisely. Return the alt text without adding surrounding quotation marks. The surrounding image tag is rebuilt separately.
+SWQSTRUCT 开头的占位符代表原始 Gutenberg 起始或结束区块注释，是不可移动的区块边界。必须保持完整 SWQSTRUCT 序列的数量、顺序和位置，不得交换相邻结构 Token、删除区块边界，或把一个结构区间中的内容移动到另一个结构区间。
 
-Never translate, rename, remove, duplicate, split, wrap or renumber any protected token. Never move SWQBLOCK, SWQHTML, SWQSTRUCT, SWQPLAINSTART, SWQPLAINSTOP, SWQALTSTART or SWQALTSTOP tokens from their original document position.
+匹配的 SWQPLAINSTART 与 SWQPLAINSTOP 之间的文本来自 Plaintext 或预格式化区块。默认翻译其中每个人类语言片段，包括作者编写的标签、注释、摘要、说明和描述，即使它们很短、单独占一行、看起来像终端输出，或与 URL、域名和标识符混合。保留机器值，但翻译其周围的人类语言说明。例如，将“中文站：”和“英文站：”译为“Chinese site:”和“English site:”，将“选择 Browser”译为“Select Browser”，并在保留域名的同时翻译“www.example.com：补丁正常输出”中的说明部分。只有当上下文明示某段原文措辞本身就是实际系统证据，修改它会造成事实错误时，才保留源语言；这项狭窄例外可用于确切界面标签、原始错误消息、原始日志或字面观测值。例如，周围正文说明“中文（中国）”是中文站实际显示的语言切换器标签时，应保留该文字。仅仅位于 Plaintext 区块、看起来像输出或只是短标签，都不足以保留源语言；无法确定自然语言片段用途时，应翻译。若 Plaintext 区域只包含 URL、域名、路径、命令、标识符、状态码或其他机器可读值，则仅将其用于理解上下文，内部文本必须原样复制且不得移动。始终保留 URL、域名、路径、命令、参数、机器标识符、状态码、箭头、标点、行序、行数、空行和缩进，不得添加 Markdown 围栏或引号。
 
-The original Gutenberg block comments are represented by SWQSTRUCT tokens. The remaining input still contains HTML tags, attributes, URLs, shortcodes, variables and document structure.
+匹配的 SWQALTSTART 与 SWQALTSTOP 之间是图片 alt 值，应自然、简洁地翻译，不得添加引号；外围图片标签会另行还原。
 
-Preserve all SWQSTRUCT tokens, HTML tags, tag attributes, block attributes, URLs, domains, shortcodes, variables, commands, parameters, configuration keys, paths, filenames and identifiers exactly as they appear.
+原始 Gutenberg 区块注释由 SWQSTRUCT 表示；其余输入仍包含 HTML 标签及属性、区块属性、URL、域名、短代码、模板变量和文档结构。所有这些内容以及命令、参数、配置键、路径、文件名、标识符、产品名和插件名都必须原样保留。
 
-Do not add, delete, merge, split or reorder Gutenberg blocks, HTML elements, paragraphs, headings, list items, table cells or sections. Preserve their hierarchy, relative order and document position.
+原文中的每个自然语言段落只能翻译一次。不得重复、遗漏、合并、拆分、替换或重新排列 Gutenberg 区块、HTML 元素、段落、标题、列表项、表格单元格或章节；保持其层级、相对顺序和文档位置。不得把前一个段落的译文复制到相邻段落。即使两个相邻段落内容相似，也必须分别翻译并保留各自结构；不得因前后文相似而跳过其中任何一个段落，也不得自行补充源内容中不存在的段落、标题、说明或总结。
 
-Within the same heading, paragraph, list item or table cell, you may reorganize sentence structure, subjects, modifiers and clauses when required for natural expression in the target language.
+在同一个标题、段落、列表项或表格单元格内部，可以根据自然英文表达需要调整句子结构、主语、修饰语和从句，但不得跨越原有结构边界移动内容。
 
-Translate only the natural-language text.
+只翻译自然语言文本。保持原意、事实、技术区别、操作步骤、时间顺序、风险判断、确定程度和结论；不得把链接误写成重定向、把缓存条目误写成数据库记录，或混淆原文中的其他技术区别。英文应自然、准确、克制且适合技术读者，不使用营销表达。
 
-Preserve the original meaning, facts, technical distinctions, operational steps, chronology, risk assessments, degree of certainty and conclusions. Do not turn links into redirects, cache entries into database records, or otherwise blur technical distinctions present in the source.
+返回前，在内部检查是否存在重复或遗漏的段落、重复或遗漏的占位符、占位符格式变化以及固定结构 Token 的数量或顺序变化；发现问题时应先自行修正，但不得输出检查过程、Token 清单、校验报告或解释。
 
-Do not add explanations, introductions, conclusions, commentary, disclaimers, marketing language, Markdown code fences or content absent from the source.
-
-Return only the complete translated article body.
+不得添加解释、引言、结语、评论、免责声明、营销语言、Markdown 代码围栏或源文不存在的内容。最终只返回完整的英文译文正文。
 PROMPT;
 	}
 
@@ -2427,4 +2425,3 @@ PROMPT;
 }
 
 SWQ_GLM52_Translation_Tuning::boot();
-
