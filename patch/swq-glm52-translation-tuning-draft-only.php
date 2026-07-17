@@ -476,6 +476,15 @@ final class SWQ_GLM52_Translation_Tuning {
 			);
 		}
 
+		$featured_image_result = self::sync_featured_image(
+			absint( $apply_input['source_post_id'] ),
+			$translated_post_id,
+			(string) $apply_input['target_language']
+		);
+		if ( is_wp_error( $featured_image_result ) ) {
+			return $featured_image_result;
+		}
+
 		$exact_persist_result = self::persist_exact_post_content(
 			$translated_post_id,
 			$validated_translated_content
@@ -485,6 +494,50 @@ final class SWQ_GLM52_Translation_Tuning {
 		}
 
 		return $apply_result;
+	}
+
+	private static function sync_featured_image(
+		int $source_post_id,
+		int $translated_post_id,
+		string $target_language
+	) {
+		$existing_thumbnail_id = (int) get_post_thumbnail_id( $translated_post_id );
+		if ( $existing_thumbnail_id > 0 ) {
+			return true;
+		}
+
+		$source_thumbnail_id = (int) get_post_thumbnail_id( $source_post_id );
+		if ( $source_thumbnail_id < 1 ) {
+			return true;
+		}
+
+		$thumbnail_id = $source_thumbnail_id;
+		if ( function_exists( 'pll_get_post' ) ) {
+			$translated_attachment_id = absint( pll_get_post( $source_thumbnail_id, $target_language ) );
+			if ( $translated_attachment_id > 0 && 'attachment' === get_post_type( $translated_attachment_id ) ) {
+				$thumbnail_id = $translated_attachment_id;
+			}
+		}
+
+		$updated = set_post_thumbnail( $translated_post_id, $thumbnail_id );
+		if ( false === $updated && $thumbnail_id !== (int) get_post_thumbnail_id( $translated_post_id ) ) {
+			return new WP_Error(
+				'swq_full_article_featured_image_sync_failed',
+				'Could not copy the source featured image to the translated post.'
+			);
+		}
+
+		self::trace_event(
+			'featured_image_synced',
+			[
+				'source_post_id'          => $source_post_id,
+				'translated_post_id'      => $translated_post_id,
+				'source_thumbnail_id'     => $source_thumbnail_id,
+				'translated_thumbnail_id' => $thumbnail_id,
+			]
+		);
+
+		return true;
 	}
 
 	/**
