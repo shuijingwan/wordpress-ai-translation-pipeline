@@ -1,0 +1,35 @@
+--- sources/mu-plugins/swq-glm52-translation-tuning.php
++++ patch/swq-glm52-translation-tuning-draft-only.php
+@@ -2,7 +2,7 @@
+ /**
+  * Plugin Name: SWQ GLM-5.2 Translation Tuning
+  * Description: Tunes GLM-5.2 requests and enables one-shot full-article translation for SlyTranslate with language-aware prompts, safe Plaintext translation, protected structures, and exact post-content persistence.
+- * Version: 2026.07.16.12
++ * Version: 2026.07.17.13
+  */
+ 
+ defined( 'ABSPATH' ) || exit;
+@@ -423,12 +423,22 @@
+ 			];
+ 		}
+ 
++		// New translations stay draft; overwrites preserve the target's current status.
++		$apply_post_status = 'draft';
++		$existing_translation_id = absint( $prepared['existing_translation_id'] ?? 0 );
++		if ( $existing_translation_id > 0 ) {
++			$existing_post_status = get_post_status( $existing_translation_id );
++			if ( is_string( $existing_post_status ) && '' !== $existing_post_status ) {
++				$apply_post_status = $existing_post_status;
++			}
++		}
++
+ 		$apply_input = [
+ 			'source_post_id'  => absint( $prepared['source_post_id'] ?? $post_id ),
+ 			'target_language' => (string) ( $prepared['target_language'] ?? $target_language ),
+ 			'source_language' => $resolved_source_language,
+ 			'overwrite'       => ! empty( $prepared['overwrite'] ),
+-			'post_status'     => (string) ( $prepared['post_status'] ?? $post_status ),
++			'post_status'     => $apply_post_status,
+ 			'source_hash'     => (string) ( $prepared['source_hash'] ?? '' ),
+ 			'translations'    => $translations,
+ 		];
