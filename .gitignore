@@ -1,5 +1,75 @@
+# Project-local working directories
 /tmp/
 /.agents/
 /.codex/
+
+# Editor and operating-system files
+.vscode/
+.idea/
+.DS_Store
+
+# Environment and local configuration
+.env
+.env.*
+!.env.example
+wp-config.php
+wp-config-*.php
+credentials.json
+secrets.json
+.secrets/
+
+# Private keys and certificates
+*.pem
+*.key
+*.p12
+*.pfx
+*.crt
+*.cer
+id_rsa
+id_rsa.pub
+id_dsa
+id_dsa.pub
+id_ecdsa
+id_ecdsa.pub
+id_ed25519
+id_ed25519.pub
+
+# Database dumps
+*.sql
+*.sql.gz
+*.dump
+*.sqlite
+*.sqlite3
+
+# Logs, debug output and raw API responses
 *.log
+debug.log
+error_log
+*.trace
+*api-response*
+*debug-dump*
+
+# Backups and temporary files
+*.bak
+*.bak-*
+*.backup
+*.orig
+*.old
+*.save
+*.swp
+*.swo
+*~
 *.tmp
+
+# Archives and generated packages
+*.zip
+*.tar
+*.tar.gz
+*.tgz
+*.7z
+
+# Python runtime files
+__pycache__/
+*.pyc
+.venv/
+venv/
