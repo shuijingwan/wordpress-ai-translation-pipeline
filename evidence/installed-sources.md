@@ -1,7 +1,7 @@
 # 实际安装源码收集记录
 
 - 收集时间：`2026-07-17T10:09:14+08:00`
-- 当前工作区：`/home/wangqiang/code/slytranslate-glm52-taxonomy-debug-2026-07-16`
+- 当前工作区：`/home/wangqiang/code/wordpress-ai-translation-pipeline`
 - 生产服务器 SSH 别名：`aliyun`
 - WordPress 根目录：`/data/wwwroot/www.shuijingwanwq.com`
 
@@ -12,7 +12,7 @@
 - 状态：`无法确认`（服务器的非交互环境中没有可用的 `wp`、`php` 或 `mysql` 命令；未加载 WordPress，也未扩大扫描范围）
 - 版本：`1.9.0`
 - 服务器路径：`/data/wwwroot/www.shuijingwanwq.com/wp-content/plugins/slytranslate`
-- 本地保存路径：`/home/wangqiang/code/slytranslate-glm52-taxonomy-debug-2026-07-16/sources/slytranslate-installed/`
+- 本地保存路径：`/home/wangqiang/code/wordpress-ai-translation-pipeline/sources/slytranslate-installed/`
 - 本地目录大小：`1,032,971 bytes`（`du -sb`）
 - 目录 SHA256：`ca8db28d663bf2f5e9738aa567ec4137f44cf7513d59943e99edf50d4ec119be`
 - SHA256 口径：对目录中所有普通文件按相对路径排序，逐文件执行 `sha256sum`，再对完整清单执行 `sha256sum`。服务器目录与本地副本所得摘要一致。
@@ -22,7 +22,7 @@
 - 文件：`swq-glm52-translation-tuning.php`
 - 服务器状态：`存在`
 - 服务器路径：`/data/wwwroot/www.shuijingwanwq.com/wp-content/mu-plugins/swq-glm52-translation-tuning.php`
-- 本地保存路径：`/home/wangqiang/code/slytranslate-glm52-taxonomy-debug-2026-07-16/sources/mu-plugins/swq-glm52-translation-tuning.php`
+- 本地保存路径：`/home/wangqiang/code/wordpress-ai-translation-pipeline/sources/mu-plugins/swq-glm52-translation-tuning.php`
 - 文件大小：`80,221 bytes`
 - SHA256：`5176c995e83cc60440ad8933da27c1ce3e6f2d603101078ef389588b282be0d8`
 - 服务器文件与本地副本 SHA256 一致。
