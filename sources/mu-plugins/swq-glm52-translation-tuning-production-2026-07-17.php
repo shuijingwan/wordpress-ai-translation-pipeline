@@ -896,11 +896,15 @@ final class SWQ_GLM52_Translation_Tuning {
 			? $source_token_matches[0]
 			: [];
 
-		// Repair only an unambiguous leading-zero contraction that passes the full strict validation.
+		// Apply only unambiguous token repairs that pass the full strict validation.
 		$translated_payload = self::normalize_unique_protected_tokens( $translated_payload, $expected_tokens );
 		$translated_payload = self::recover_uniquely_located_missing_token(
 			$translated_payload,
 			$payload,
+			$expected_tokens
+		);
+		$translated_payload = self::repair_uniquely_misnumbered_adjacent_token(
+			$translated_payload,
 			$expected_tokens
 		);
 		$token_validation   = self::validate_protected_tokens(
@@ -2013,13 +2017,13 @@ final class SWQ_GLM52_Translation_Tuning {
 		$expected_fixed_tokens = array_values(
 			array_filter(
 				$expected_tokens,
-				static fn ( string $token ): bool => ! str_starts_with( $token, 'SWQINLINE' )
+				[ self::class, 'is_fixed_order_protected_token' ]
 			)
 		);
 		$actual_fixed_tokens = array_values(
 			array_filter(
 				$actual_tokens,
-				static fn ( string $token ): bool => ! str_starts_with( $token, 'SWQINLINE' )
+				[ self::class, 'is_fixed_order_protected_token' ]
 			)
 		);
 
@@ -2095,6 +2099,96 @@ final class SWQ_GLM52_Translation_Tuning {
 			: $translated;
 	}
 
+	private static function repair_uniquely_misnumbered_adjacent_token(
+		string $translated,
+		array $expected_tokens
+	): string {
+		preg_match_all( self::PROTECTED_TOKEN_REGEX, $translated, $matches, PREG_OFFSET_CAPTURE );
+		$actual_matches = isset( $matches[0] ) && is_array( $matches[0] ) ? $matches[0] : [];
+		$actual_tokens  = array_column( $actual_matches, 0 );
+		$expected_count = count( $expected_tokens );
+
+		if ( 0 === $expected_count
+			|| $expected_count !== count( $actual_tokens )
+			|| $expected_count !== count( array_unique( $expected_tokens ) )
+		) {
+			return $translated;
+		}
+
+		$missing_tokens = array_values( array_diff( $expected_tokens, $actual_tokens ) );
+		if ( 1 !== count( $missing_tokens ) || [] !== array_diff( $actual_tokens, $expected_tokens ) ) {
+			return $translated;
+		}
+
+		$duplicate_tokens = array_filter(
+			array_count_values( $actual_tokens ),
+			static fn ( int $count ): bool => $count > 1
+		);
+		if ( 1 !== count( $duplicate_tokens ) || 2 !== reset( $duplicate_tokens ) ) {
+			return $translated;
+		}
+
+		$mismatch_indexes = [];
+		foreach ( $expected_tokens as $index => $expected_token ) {
+			if ( $expected_token !== $actual_tokens[ $index ] ) {
+				$mismatch_indexes[] = $index;
+			}
+		}
+
+		if ( 1 !== count( $mismatch_indexes ) ) {
+			return $translated;
+		}
+
+		$mismatch_index = $mismatch_indexes[0];
+		if ( 0 === $mismatch_index || $mismatch_index === $expected_count - 1 ) {
+			return $translated;
+		}
+
+		$missing_token   = $missing_tokens[0];
+		$duplicate_token = (string) array_key_first( $duplicate_tokens );
+		if ( $expected_tokens[ $mismatch_index ] !== $missing_token
+			|| $actual_tokens[ $mismatch_index ] !== $duplicate_token
+			|| $expected_tokens[ $mismatch_index - 1 ] !== $actual_tokens[ $mismatch_index - 1 ]
+			|| $expected_tokens[ $mismatch_index + 1 ] !== $actual_tokens[ $mismatch_index + 1 ]
+			|| ! self::is_fixed_order_protected_token( $missing_token )
+			|| ! self::is_fixed_order_protected_token( $duplicate_token )
+		) {
+			return $translated;
+		}
+
+		$token_pattern = '/^SWQ([A-Z]+)(\d{6})END$/';
+		if ( 1 !== preg_match( $token_pattern, $missing_token, $missing_parts )
+			|| 1 !== preg_match( $token_pattern, $duplicate_token, $duplicate_parts )
+			|| $missing_parts[1] !== $duplicate_parts[1]
+			|| 1 !== abs( (int) $missing_parts[2] - (int) $duplicate_parts[2] )
+		) {
+			return $translated;
+		}
+
+		$actual_match = $actual_matches[ $mismatch_index ] ?? null;
+		if ( ! is_array( $actual_match )
+			|| $duplicate_token !== ( $actual_match[0] ?? null )
+			|| ! is_int( $actual_match[1] ?? null )
+		) {
+			return $translated;
+		}
+
+		$repaired = substr_replace(
+			$translated,
+			$missing_token,
+			$actual_match[1],
+			strlen( $duplicate_token )
+		);
+
+		return self::protected_token_sequence_is_strictly_valid( $repaired, $expected_tokens )
+			? $repaired
+			: $translated;
+	}
+
+	private static function is_fixed_order_protected_token( string $token ): bool {
+		return ! str_starts_with( $token, 'SWQINLINE' );
+	}
+
 	private static function validate_protected_tokens(
 		string $translated,
 		array $expected_tokens,
@@ -2121,14 +2215,14 @@ final class SWQ_GLM52_Translation_Tuning {
 		$expected_fixed_tokens = array_values(
 			array_filter(
 				$expected_tokens,
-				static fn ( string $token ): bool => ! str_starts_with( $token, 'SWQINLINE' )
+				[ self::class, 'is_fixed_order_protected_token' ]
 			)
 		);
 
 		$actual_fixed_tokens = array_values(
 			array_filter(
 				$actual_tokens,
-				static fn ( string $token ): bool => ! str_starts_with( $token, 'SWQINLINE' )
+				[ self::class, 'is_fixed_order_protected_token' ]
 			)
 		);
 
