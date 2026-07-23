@@ -2,7 +2,7 @@
 /**
  * Plugin Name: SWQ GLM-5.2 Translation Tuning
  * Description: Tunes GLM-5.2 requests and enables one-shot full-article translation for SlyTranslate with language-aware prompts, safe Plaintext translation, protected structures, and exact post-content persistence.
- * Version: 2026.07.17.16
+ * Version: 2026.07.23.17
  */
 
 defined( 'ABSPATH' ) || exit;
@@ -454,10 +454,24 @@ final class SWQ_GLM52_Translation_Tuning {
 			]
 		);
 
+		return self::continue_after_apply(
+			$apply_result,
+			$apply_input,
+			$validated_translated_content
+		);
+	}
+
+	/**
+	 * @return array|WP_Error
+	 */
+	private static function continue_after_apply(
+		$apply_result,
+		array $apply_input,
+		$validated_translated_content
+	) {
 		if ( is_wp_error( $apply_result ) ) {
 			return $apply_result;
 		}
-
 		if ( ! is_string( $validated_translated_content ) ) {
 			return new WP_Error(
 				'swq_full_article_validated_content_missing',
@@ -468,7 +482,6 @@ final class SWQ_GLM52_Translation_Tuning {
 		$translated_post_id = is_array( $apply_result )
 			? absint( $apply_result['translated_post_id'] ?? 0 )
 			: 0;
-
 		if ( $translated_post_id < 1 ) {
 			return new WP_Error(
 				'swq_full_article_translated_post_id_missing',
@@ -476,15 +489,28 @@ final class SWQ_GLM52_Translation_Tuning {
 			);
 		}
 
-		$featured_image_result = self::sync_featured_image(
-			absint( $apply_input['source_post_id'] ),
+		return self::finalize_full_article_result(
+			$apply_result,
+			$apply_input,
 			$translated_post_id,
-			(string) $apply_input['target_language']
+			$validated_translated_content
 		);
-		if ( is_wp_error( $featured_image_result ) ) {
-			return $featured_image_result;
-		}
+	}
 
+	/**
+	 * Persist the translated body, then run non-transactional featured-image post-processing.
+	 *
+	 * Once exact persistence succeeds, the article translation is complete. A featured-image
+	 * failure is therefore returned as a warning attached to the successful apply result.
+	 *
+	 * @return array|WP_Error
+	 */
+	private static function finalize_full_article_result(
+		array $apply_result,
+		array $apply_input,
+		int $translated_post_id,
+		string $validated_translated_content
+	) {
 		$exact_persist_result = self::persist_exact_post_content(
 			$translated_post_id,
 			$validated_translated_content
@@ -493,51 +519,598 @@ final class SWQ_GLM52_Translation_Tuning {
 			return $exact_persist_result;
 		}
 
+		$source_post_id       = absint( $apply_input['source_post_id'] ?? 0 );
+		$source_attachment_id = (int) get_post_thumbnail_id( $source_post_id );
+		$featured_image_result = self::sync_featured_image(
+			$source_post_id,
+			$translated_post_id,
+			(string) ( $apply_input['target_language'] ?? '' ),
+			$validated_translated_content,
+			(string) get_post_field( 'post_title', $translated_post_id, 'raw' )
+		);
+
+		if ( is_wp_error( $featured_image_result ) ) {
+			$error_data = $featured_image_result->get_error_data();
+			$error_data = is_array( $error_data ) ? $error_data : [];
+			$featured_image_result = [
+				'status'               => 'sync_warning',
+				'source_attachment_id' => $source_attachment_id,
+				'target_attachment_id' => absint(
+					$error_data['target_attachment_id']
+						?? $error_data['created_attachment_id']
+						?? 0
+				),
+				'alt_source'           => '',
+				'alt_status'           => '',
+				'warning_code'         => $featured_image_result->get_error_code(),
+				'warning_message'      => sprintf(
+					'The English article was saved, but featured-image post-processing did not complete: %s',
+					$featured_image_result->get_error_message()
+				),
+			];
+			self::trace_event( 'featured_image_sync_warning', $featured_image_result );
+		}
+
+		$apply_result['featured_image_sync'] = $featured_image_result;
 		return $apply_result;
 	}
 
 	private static function sync_featured_image(
 		int $source_post_id,
 		int $translated_post_id,
-		string $target_language
+		string $target_language,
+		string $translated_content = '',
+		string $translated_title = ''
 	) {
-		$existing_thumbnail_id = (int) get_post_thumbnail_id( $translated_post_id );
-		if ( $existing_thumbnail_id > 0 ) {
-			return true;
-		}
-
 		$source_thumbnail_id = (int) get_post_thumbnail_id( $source_post_id );
 		if ( $source_thumbnail_id < 1 ) {
-			return true;
+			$result = [
+				'status'               => 'no_source_featured_image',
+				'source_attachment_id' => 0,
+				'target_attachment_id' => 0,
+				'alt_source'           => '',
+				'alt_status'           => '',
+				'warning_code'         => '',
+				'warning_message'      => '',
+			];
+			self::trace_event( 'featured_image_sync_finished', $result );
+			return $result;
 		}
 
-		$thumbnail_id = $source_thumbnail_id;
-		if ( function_exists( 'pll_get_post' ) ) {
-			$translated_attachment_id = absint( pll_get_post( $source_thumbnail_id, $target_language ) );
-			if ( $translated_attachment_id > 0 && 'attachment' === get_post_type( $translated_attachment_id ) ) {
-				$thumbnail_id = $translated_attachment_id;
+		$existing_thumbnail_id    = (int) get_post_thumbnail_id( $translated_post_id );
+		$known_translation_id     = function_exists( 'pll_get_post' )
+			? absint( pll_get_post( $source_thumbnail_id, $target_language ) )
+			: 0;
+		$uses_source_image_family = $existing_thumbnail_id < 1
+			|| $existing_thumbnail_id === $source_thumbnail_id
+			|| ( $known_translation_id > 0 && $existing_thumbnail_id === $known_translation_id );
+
+		if ( ! $uses_source_image_family ) {
+			$same_file_without_relation = (
+				'attachment' === get_post_type( $existing_thumbnail_id )
+				&& function_exists( 'pll_get_post_language' )
+				&& $target_language === (string) pll_get_post_language( $existing_thumbnail_id, 'slug' )
+				&& '' !== (string) get_post_meta( $source_thumbnail_id, '_wp_attached_file', true )
+				&& (string) get_post_meta( $source_thumbnail_id, '_wp_attached_file', true )
+					=== (string) get_post_meta( $existing_thumbnail_id, '_wp_attached_file', true )
+			);
+			$result = [
+				'status'               => $same_file_without_relation
+					? 'existing_same_file_without_translation_relation'
+					: 'manual_featured_image_preserved',
+				'source_attachment_id' => $source_thumbnail_id,
+				'target_attachment_id' => $existing_thumbnail_id,
+				'alt_source'           => '',
+				'alt_status'           => '',
+				'warning_code'         => $same_file_without_relation
+					? 'existing_same_file_without_translation_relation'
+					: '',
+				'warning_message'      => $same_file_without_relation
+					? 'The current target-language featured image shares the source file but has no Polylang translation relation; it was preserved for manual review.'
+					: '',
+			];
+			self::trace_event( 'featured_image_sync_finished', $result );
+			return $result;
+		}
+
+		$attachment_result = self::create_polylang_media_translation(
+			$source_thumbnail_id,
+			$target_language
+		);
+		if ( is_wp_error( $attachment_result ) ) {
+			return $attachment_result;
+		}
+
+		$translated_attachment_id = (int) $attachment_result['attachment_id'];
+		$source_url                = (string) wp_get_attachment_url( $source_thumbnail_id );
+		$attached_file             = (string) get_post_meta( $source_thumbnail_id, '_wp_attached_file', true );
+		$attachment_metadata       = wp_get_attachment_metadata( $source_thumbnail_id, true );
+		$attachment_metadata       = is_array( $attachment_metadata ) ? $attachment_metadata : [];
+		$alt                       = self::find_translated_image_alt_in_content(
+			$translated_content,
+			$source_thumbnail_id,
+			$source_url,
+			$attached_file,
+			$attachment_metadata
+		);
+		$alt_source                = '';
+
+		if ( '' !== $alt ) {
+			$alt_source = 'content';
+		} else {
+			$translated_title = self::normalize_translated_title_alt( $translated_title );
+			if ( '' !== $translated_title ) {
+				$alt        = $translated_title;
+				$alt_source = 'title';
 			}
 		}
 
-		$updated = set_post_thumbnail( $translated_post_id, $thumbnail_id );
-		if ( false === $updated && $thumbnail_id !== (int) get_post_thumbnail_id( $translated_post_id ) ) {
+		$alt_result = self::persist_translated_attachment_alt(
+			$translated_attachment_id,
+			$alt,
+			$alt_source,
+			! empty( $attachment_result['created'] )
+		);
+		if ( is_wp_error( $alt_result ) ) {
+			return $alt_result;
+		}
+
+		if ( $translated_attachment_id !== $existing_thumbnail_id ) {
+			$updated = set_post_thumbnail( $translated_post_id, $translated_attachment_id );
+			if (
+				false === $updated
+				&& $translated_attachment_id !== (int) get_post_thumbnail_id( $translated_post_id )
+			) {
+				return new WP_Error(
+					'swq_full_article_featured_image_set_failed',
+					'Could not set the translated media attachment as the translated post featured image.',
+					[
+						'translated_post_id' => $translated_post_id,
+						'target_attachment_id' => $translated_attachment_id,
+					]
+				);
+			}
+		}
+
+		$result = [
+			'status'               => $attachment_result['status'],
+			'source_attachment_id' => $source_thumbnail_id,
+			'target_attachment_id' => $translated_attachment_id,
+			'alt_source'           => $alt_result['alt_source'],
+			'alt_status'           => $alt_result['status'],
+			'warning_code'         => (string) ( $attachment_result['warning_code'] ?? '' ),
+			'warning_message'      => (string) ( $attachment_result['warning_message'] ?? '' ),
+		];
+		self::trace_event( 'featured_image_sync_finished', $result );
+		return $result;
+	}
+
+	/**
+	 * @return array{status:string,alt_source:string}|WP_Error
+	 */
+	private static function persist_translated_attachment_alt(
+		int $translated_attachment_id,
+		string $target_alt,
+		string $alt_source,
+		bool $created
+	) {
+		$meta_key    = '_wp_attachment_image_alt';
+		$current_alt = (string) get_post_meta( $translated_attachment_id, $meta_key, true );
+
+		if ( '' !== $alt_source ) {
+			if ( $current_alt === $target_alt ) {
+				return [ 'status' => 'alt_unchanged', 'alt_source' => $alt_source ];
+			}
+			update_post_meta( $translated_attachment_id, $meta_key, $target_alt );
+			if ( $target_alt !== (string) get_post_meta( $translated_attachment_id, $meta_key, true ) ) {
+				return new WP_Error(
+					'swq_featured_image_alt_update_failed',
+					'The translated attachment alt text did not match the requested value after update.',
+					[ 'target_attachment_id' => $translated_attachment_id ]
+				);
+			}
+			return [
+				'status'     => 'content' === $alt_source
+					? 'alt_updated_from_content'
+					: 'alt_updated_from_title',
+				'alt_source' => $alt_source,
+			];
+		}
+
+		if ( $created && '' !== $current_alt ) {
+			delete_post_meta( $translated_attachment_id, $meta_key );
+			if ( '' !== (string) get_post_meta( $translated_attachment_id, $meta_key, true ) ) {
+				return new WP_Error(
+					'swq_featured_image_alt_clear_failed',
+					'The source-language alt text copied to the new attachment could not be cleared.',
+					[ 'target_attachment_id' => $translated_attachment_id ]
+				);
+			}
+			return [ 'status' => 'new_attachment_alt_cleared', 'alt_source' => '' ];
+		}
+
+		return [ 'status' => 'no_alt_source_preserved', 'alt_source' => '' ];
+	}
+
+	/**
+	 * Create or reuse Polylang's target-language attachment record.
+	 *
+	 * @return array{attachment_id:int,created:bool,status:string}|WP_Error
+	 */
+	private static function create_polylang_media_translation(
+		int $source_attachment_id,
+		string $target_language
+	) {
+		if ( ! function_exists( 'pll_get_post' ) || ! function_exists( 'PLL' ) ) {
 			return new WP_Error(
-				'swq_full_article_featured_image_sync_failed',
-				'Could not copy the source featured image to the translated post.'
+				'swq_featured_image_polylang_unavailable',
+				'Polylang runtime APIs are unavailable for media translation.'
+			);
+		}
+		if ( 'attachment' !== get_post_type( $source_attachment_id ) ) {
+			return new WP_Error(
+				'swq_featured_image_invalid_source_attachment',
+				'The source featured image is not a valid attachment.'
 			);
 		}
 
-		self::trace_event(
-			'featured_image_synced',
-			[
-				'source_post_id'          => $source_post_id,
-				'translated_post_id'      => $translated_post_id,
-				'source_thumbnail_id'     => $source_thumbnail_id,
-				'translated_thumbnail_id' => $thumbnail_id,
-			]
-		);
+		$polylang = PLL();
+		if (
+			! is_object( $polylang )
+			|| empty( $polylang->model )
+			|| empty( $polylang->model->post )
+		) {
+			return new WP_Error(
+				'swq_featured_image_polylang_runtime_invalid',
+				'Polylang translated-post runtime is unavailable.'
+			);
+		}
+		if ( empty( $polylang->options['media_support'] ) ) {
+			return new WP_Error(
+				'swq_featured_image_media_support_disabled',
+				'Polylang media translation support is disabled.'
+			);
+		}
+		if (
+			'' === $target_language
+			|| ! is_object( $polylang->model->get_language( $target_language ) )
+		) {
+			return new WP_Error(
+				'swq_featured_image_invalid_target_language',
+				'The requested target language is not registered in Polylang.'
+			);
+		}
 
-		return true;
+		$existing_id = absint( pll_get_post( $source_attachment_id, $target_language ) );
+		if ( $existing_id > 0 ) {
+			return self::validate_polylang_media_translation(
+				$source_attachment_id,
+				$existing_id,
+				$target_language,
+				false
+			);
+		}
+		if ( ! is_callable( [ $polylang->model->post, 'create_media_translation' ] ) ) {
+			return new WP_Error(
+				'swq_featured_image_create_method_unavailable',
+				'Polylang create_media_translation() is not callable.'
+			);
+		}
+
+		try {
+			$created_id = absint(
+				$polylang->model->post->create_media_translation(
+					$source_attachment_id,
+					$target_language
+				)
+			);
+		} catch ( Throwable $throwable ) {
+			$relation_after_exception = absint(
+				pll_get_post( $source_attachment_id, $target_language )
+			);
+			self::trace_event(
+				'featured_image_polylang_create_exception',
+				[
+					'source_attachment_id'    => $source_attachment_id,
+					'target_language'         => $target_language,
+					'exception_class'         => get_class( $throwable ),
+					'exception_message'       => $throwable->getMessage(),
+					'relation_after_exception' => $relation_after_exception,
+					'possible_orphan_attachment' => $relation_after_exception < 1,
+				]
+			);
+			if ( $relation_after_exception > 0 ) {
+				$recovered = self::validate_polylang_media_translation(
+					$source_attachment_id,
+					$relation_after_exception,
+					$target_language,
+					true
+				);
+				if ( ! is_wp_error( $recovered ) ) {
+					$recovered['warning_code'] = 'polylang_exception_relation_recovered';
+					$recovered['warning_message'] = sprintf(
+						'Polylang raised %1$s while creating the media translation, but the resulting attachment relation was valid: %2$s',
+						get_class( $throwable ),
+						$throwable->getMessage()
+					);
+					return $recovered;
+				}
+			}
+			return new WP_Error(
+				'swq_featured_image_create_failed',
+				'Polylang threw an exception while creating the target-language media attachment. No valid relation was found afterward; an unlinked partial attachment may exist.',
+				[
+					'exception_class' => get_class( $throwable ),
+					'message'         => $throwable->getMessage(),
+					'relation_after_exception' => $relation_after_exception,
+					'possible_orphan_attachment' => true,
+				]
+			);
+		}
+		if ( $created_id < 1 ) {
+			return new WP_Error(
+				'swq_featured_image_create_failed',
+				'Polylang could not create the target-language media attachment.'
+			);
+		}
+
+		$verified_id = absint( pll_get_post( $source_attachment_id, $target_language ) );
+		if ( $verified_id < 1 || $verified_id !== $created_id ) {
+			return new WP_Error(
+				'swq_featured_image_translation_relation_missing',
+				'Polylang did not expose the created attachment translation relation.',
+				[ 'created_attachment_id' => $created_id ]
+			);
+		}
+
+		return self::validate_polylang_media_translation(
+			$source_attachment_id,
+			$verified_id,
+			$target_language,
+			true
+		);
+	}
+
+	/**
+	 * @return array{attachment_id:int,created:bool,status:string}|WP_Error
+	 */
+	private static function validate_polylang_media_translation(
+		int $source_attachment_id,
+		int $translated_attachment_id,
+		string $target_language,
+		bool $created
+	) {
+		if ( 'attachment' !== get_post_type( $translated_attachment_id ) ) {
+			return new WP_Error(
+				'swq_featured_image_invalid_translated_attachment',
+				'Polylang returned a translation that is not an attachment.'
+			);
+		}
+		if (
+			! function_exists( 'pll_get_post_language' )
+			|| $target_language !== (string) pll_get_post_language( $translated_attachment_id, 'slug' )
+		) {
+			return new WP_Error(
+				'swq_featured_image_translated_language_mismatch',
+				'The translated media attachment language does not match the target language.'
+			);
+		}
+		if (
+			$translated_attachment_id
+			!== absint( pll_get_post( $source_attachment_id, $target_language ) )
+		) {
+			return new WP_Error(
+				'swq_featured_image_translation_relation_invalid',
+				'The target attachment is not linked to the source attachment in Polylang.'
+			);
+		}
+
+		return [
+			'attachment_id' => $translated_attachment_id,
+			'created'       => $created,
+			'status'        => $created ? 'translated_attachment_created' : 'translated_attachment_reused',
+		];
+	}
+
+	private static function find_translated_image_alt_in_content(
+		string $content,
+		int $source_attachment_id,
+		string $source_url,
+		string $attached_file,
+		array $attachment_metadata = []
+	): string {
+		if ( '' === $content ) {
+			return '';
+		}
+
+		$class_marker = 'wp-image-' . $source_attachment_id;
+		$class_matches = [];
+		$url_matches   = [];
+		$allowed_paths = self::build_source_image_paths(
+			$source_url,
+			$attached_file,
+			$attachment_metadata
+		);
+		foreach ( self::read_image_attributes_from_content( $content ) as $attributes ) {
+			$classes    = preg_split( '/\s+/', trim( $attributes['class'] ?? '' ) );
+			if ( in_array( $class_marker, $classes, true ) ) {
+				$class_matches[] = $attributes;
+			} elseif ( self::image_attributes_match_source( $attributes, $allowed_paths ) ) {
+				$url_matches[] = $attributes;
+			}
+		}
+
+		foreach ( array_merge( $class_matches, $url_matches ) as $attributes ) {
+			$alt = self::normalize_image_alt( $attributes['alt'] ?? '' );
+			if ( '' !== $alt ) {
+				return $alt;
+			}
+		}
+		return '';
+	}
+
+	/**
+	 * Read image attributes without modifying or serializing the source HTML.
+	 *
+	 * @return array<int,array<string,string>>
+	 */
+	private static function read_image_attributes_from_content( string $content ): array {
+		$images = [];
+		if ( class_exists( 'WP_HTML_Tag_Processor' ) ) {
+			$processor = new WP_HTML_Tag_Processor( $content );
+			while ( $processor->next_tag( 'IMG' ) ) {
+				$attributes = [];
+				foreach ( [ 'class', 'src', 'srcset', 'alt' ] as $name ) {
+					$value = $processor->get_attribute( $name );
+					if ( is_string( $value ) ) {
+						$attributes[ $name ] = $value;
+					}
+				}
+				$images[] = $attributes;
+			}
+			return $images;
+		}
+
+		foreach ( self::scan_img_tags( $content ) as $img_tag ) {
+			$attributes = [];
+			preg_match_all(
+				'/\b([a-zA-Z_:][a-zA-Z0-9_:.-]*)\s*=\s*(["\'])(.*?)\2/s',
+				$img_tag,
+				$matches,
+				PREG_SET_ORDER
+			);
+			foreach ( $matches as $match ) {
+				$name = strtolower( $match[1] );
+				if ( in_array( $name, [ 'class', 'src', 'srcset', 'alt' ], true ) ) {
+					$attributes[ $name ] = html_entity_decode(
+						$match[3],
+						ENT_QUOTES | ENT_HTML5,
+						'UTF-8'
+					);
+				}
+			}
+			$images[] = $attributes;
+		}
+		return $images;
+	}
+
+	/**
+	 * Compatibility scanner for WordPress versions without WP_HTML_Tag_Processor.
+	 *
+	 * @return string[]
+	 */
+	private static function scan_img_tags( string $content ): array {
+		$tags   = [];
+		$length = strlen( $content );
+		$offset = 0;
+		while ( $offset < $length && preg_match( '/<img\b/i', $content, $match, PREG_OFFSET_CAPTURE, $offset ) ) {
+			$start = (int) $match[0][1];
+			$quote = '';
+			for ( $index = $start + strlen( $match[0][0] ); $index < $length; ++$index ) {
+				$character = $content[ $index ];
+				if ( '' !== $quote ) {
+					if ( $character === $quote ) {
+						$quote = '';
+					}
+					continue;
+				}
+				if ( '"' === $character || "'" === $character ) {
+					$quote = $character;
+				} elseif ( '>' === $character ) {
+					$tags[] = substr( $content, $start, $index - $start + 1 );
+					$offset = $index + 1;
+					continue 2;
+				}
+			}
+			break;
+		}
+		return $tags;
+	}
+
+	/**
+	 * @param array<string,string> $attributes
+	 * @param string[]             $allowed_paths
+	 */
+	private static function image_attributes_match_source(
+		array $attributes,
+		array $allowed_paths
+	): bool {
+		if ( empty( $allowed_paths ) ) {
+			return false;
+		}
+
+		$urls = [];
+		if ( ! empty( $attributes['src'] ) ) {
+			$urls[] = $attributes['src'];
+		}
+		if ( ! empty( $attributes['srcset'] ) ) {
+			foreach ( explode( ',', $attributes['srcset'] ) as $srcset_item ) {
+				$urls[] = preg_split( '/\s+/', trim( $srcset_item ) )[0] ?? '';
+			}
+		}
+		foreach ( $urls as $url ) {
+			$candidate = self::normalize_image_path( $url );
+			if ( '' !== $candidate && in_array( $candidate, $allowed_paths, true ) ) {
+				return true;
+			}
+		}
+		return false;
+	}
+
+	/**
+	 * @param array<string,mixed> $attachment_metadata
+	 * @return string[]
+	 */
+	private static function build_source_image_paths(
+		string $source_url,
+		string $attached_file,
+		array $attachment_metadata
+	): array {
+		$base_paths = array_values(
+			array_unique(
+				array_filter(
+					[
+						self::normalize_image_path( $source_url ),
+						self::normalize_image_path( $attached_file ),
+						self::normalize_image_path( (string) ( $attachment_metadata['file'] ?? '' ) ),
+					]
+				)
+			)
+		);
+		$paths = $base_paths;
+		$sizes = isset( $attachment_metadata['sizes'] ) && is_array( $attachment_metadata['sizes'] )
+			? $attachment_metadata['sizes']
+			: [];
+		foreach ( $sizes as $size ) {
+			if ( ! is_array( $size ) || empty( $size['file'] ) || ! is_string( $size['file'] ) ) {
+				continue;
+			}
+			foreach ( $base_paths as $base_path ) {
+				$paths[] = self::normalize_image_path(
+					rtrim( dirname( $base_path ), '/' ) . '/' . ltrim( $size['file'], '/' )
+				);
+			}
+		}
+		return array_values( array_unique( array_filter( $paths ) ) );
+	}
+
+	private static function normalize_image_path( string $value ): string {
+		$value = trim( $value );
+		if ( '' === $value ) {
+			return '';
+		}
+		$path = wp_parse_url( $value, PHP_URL_PATH );
+		$path = is_string( $path ) && '' !== $path ? $path : strtok( $value, '?#' );
+		$path = rawurldecode( (string) $path );
+		return '/' . ltrim( $path, '/' );
+	}
+
+	private static function normalize_image_alt( string $value ): string {
+		return trim( $value );
+	}
+
+	private static function normalize_translated_title_alt( string $value ): string {
+		return trim( html_entity_decode( $value, ENT_QUOTES | ENT_HTML5, 'UTF-8' ) );
 	}
 
 	/**
