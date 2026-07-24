@@ -13,7 +13,7 @@ class WP_Error {
 	public function get_error_data() { return $this->data; }
 }
 
-require '/tmp/swq-glm52-translation-tuning-candidate.php';
+require __DIR__ . '/swq-glm52-translation-tuning.php';
 
 function invoke_private( string $method, ...$args ) {
 	$reflection = new ReflectionMethod( 'SWQ_GLM52_Translation_Tuning', $method );

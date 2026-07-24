@@ -2,7 +2,7 @@
 /**
  * Plugin Name: SWQ GLM-5.2 Translation Tuning
  * Description: Tunes GLM-5.2 requests and enables one-shot full-article translation for SlyTranslate with language-aware prompts, safe Plaintext translation, protected structures, and exact post-content persistence.
- * Version: 2026.07.23.17
+ * Version: 2026.07.24.18
  */
 
 defined( 'ABSPATH' ) || exit;
@@ -16,7 +16,7 @@ final class SWQ_GLM52_Translation_Tuning {
 	private const FULL_ARTICLE_TIMEOUT = 600;
 	private const FULL_ARTICLE_RUNAWAY_OUTPUT_RATIO = 6.0;
 	private const TRACE_FILE = '/tmp/swq-glm52-execution-trace.jsonl';
-	private const PROMPT_POLICY_VERSION = '2026-07-16-v11';
+	private const PROMPT_POLICY_VERSION = '2026-07-24-v12';
 	private const PROTECTED_TOKEN_REGEX = '/SWQ(?:BLOCK|INLINE|HTML|STRUCT|PLAINSTART|PLAINSTOP|ALTSTART|ALTSTOP)\d{6}END/';
 	private const PROTECTED_TOKEN_LIKE_REGEX = '/SWQ(?:BLOCK|INLINE|HTML|STRUCT|PLAINSTART|PLAINSTOP|ALTSTART|ALTSTOP)\d+END/';
 
@@ -1491,6 +1491,14 @@ final class SWQ_GLM52_Translation_Tuning {
 			return $token_validation;
 		}
 
+		$plaintext_validation = self::validate_plaintext_regions(
+			$translated_payload,
+			$plain_regions
+		);
+		if ( is_wp_error( $plaintext_validation ) ) {
+			return $plaintext_validation;
+		}
+
 		$translation_validation = self::validate_translation( $payload, $translated_payload, $to );
 		if ( is_wp_error( $translation_validation ) ) {
 			return $translation_validation;
@@ -1895,6 +1903,54 @@ final class SWQ_GLM52_Translation_Tuning {
 		return $payload;
 	}
 
+	private static function plaintext_structure_error( string $code, string $message ): WP_Error {
+		return new WP_Error(
+			$code,
+			$message,
+			[
+				'status'         => 422,
+				'swq_error_type' => 'plaintext_structure_error',
+				'retryable'      => false,
+			]
+		);
+	}
+
+	private static function validate_plaintext_regions( string $payload, array $plain_regions ) {
+		foreach ( $plain_regions as $region ) {
+			$start_token = (string) ( $region['start_token'] ?? '' );
+			$stop_token  = (string) ( $region['stop_token'] ?? '' );
+			$source_text = (string) ( $region['source_text'] ?? '' );
+			$match       = self::extract_marker_region( $payload, $start_token, $stop_token );
+
+			if ( is_wp_error( $match ) ) {
+				return self::plaintext_structure_error(
+					'swq_full_article_plaintext_region_missing',
+					sprintf( 'Could not restore the Plaintext region beginning with %s.', $start_token )
+				);
+			}
+
+			$translated_text = (string) $match['text'];
+			if ( '' !== trim( $source_text ) && '' === trim( $translated_text ) ) {
+				return self::plaintext_structure_error(
+					'swq_full_article_plaintext_translation_empty',
+					sprintf( 'The Plaintext region beginning with %s was empty after translation.', $start_token )
+				);
+			}
+
+			if ( preg_match( self::PROTECTED_TOKEN_REGEX, $translated_text ) ) {
+				return self::plaintext_structure_error(
+					'swq_full_article_plaintext_boundary_drift',
+					sprintf(
+						'The Plaintext region beginning with %s swallowed a protected boundary or adjacent region.',
+						$start_token
+					)
+				);
+			}
+		}
+
+		return true;
+	}
+
 	private static function restore_plain_region( string $payload, array $region ) {
 		$start_token = (string) ( $region['start_token'] ?? '' );
 		$stop_token  = (string) ( $region['stop_token'] ?? '' );
@@ -2032,29 +2088,7 @@ final class SWQ_GLM52_Translation_Tuning {
 		$translated_lf  = str_replace( [ "\r\n", "\r" ], "\n", trim( $translated, "\r\n" ) );
 		$source_body    = rtrim( $source_lf, "\n" );
 		$source_trailer = substr( $source_lf, strlen( $source_body ) );
-		$source_lines   = explode( "\n", $source_body );
-		$translated_lines = explode( "\n", $translated_lf );
-
-		if ( count( $source_lines ) !== count( $translated_lines ) ) {
-			return new WP_Error(
-				'swq_full_article_plaintext_line_count_changed',
-				sprintf(
-					'Plaintext line count changed during translation: source=%d, translated=%d.',
-					count( $source_lines ),
-					count( $translated_lines )
-				)
-			);
-		}
-
-		foreach ( $source_lines as $index => $source_line ) {
-			$indent = '';
-			if ( preg_match( '/^[ \t]*/', $source_line, $indent_match ) ) {
-				$indent = (string) $indent_match[0];
-			}
-			$translated_lines[ $index ] = $indent . ltrim( $translated_lines[ $index ], " \t" );
-		}
-
-		$normalized = implode( "\n", $translated_lines ) . $source_trailer;
+		$normalized     = $translated_lf . $source_trailer;
 		if ( "\r\n" === $source_newline ) {
 			$normalized = str_replace( "\n", "\r\n", $normalized );
 		}
@@ -3025,7 +3059,7 @@ SWQHTML 开头的占位符代表固定 HTML 元素，必须逐字符原样保留
 
 SWQSTRUCT 开头的占位符代表原始 Gutenberg 起始或结束区块注释，是不可移动的区块边界。必须保持完整 SWQSTRUCT 序列的数量、顺序和位置，不得交换相邻结构 Token、删除区块边界，或把一个结构区间中的内容移动到另一个结构区间。
 
-匹配的 SWQPLAINSTART 与 SWQPLAINSTOP 之间的文本来自 Plaintext 或预格式化区块。默认翻译其中每个人类语言片段，包括作者编写的标签、注释、摘要、说明和描述，即使它们很短、单独占一行、看起来像终端输出，或与 URL、域名和标识符混合。保留机器值，但翻译其周围的人类语言说明。例如，将“中文站：”和“英文站：”译为“Chinese site:”和“English site:”，将“选择 Browser”译为“Select Browser”，并在保留域名的同时翻译“www.example.com：补丁正常输出”中的说明部分。只有当上下文明示某段原文措辞本身就是实际系统证据，修改它会造成事实错误时，才保留源语言；这项狭窄例外可用于确切界面标签、原始错误消息、原始日志或字面观测值。例如，周围正文说明“中文（中国）”是中文站实际显示的语言切换器标签时，应保留该文字。仅仅位于 Plaintext 区块、看起来像输出或只是短标签，都不足以保留源语言；无法确定自然语言片段用途时，应翻译。若 Plaintext 区域只包含 URL、域名、路径、命令、标识符、状态码或其他机器可读值，则仅将其用于理解上下文，内部文本必须原样复制且不得移动。始终保留 URL、域名、路径、命令、参数、机器标识符、状态码、箭头、标点、行序、行数、空行和缩进，不得添加 Markdown 围栏或引号。
+匹配的 SWQPLAINSTART 与 SWQPLAINSTOP 之间的文本来自 Plaintext 或预格式化区块。每一对 START/STOP 是不可移动的区块级边界，必须完整、唯一、按编号顺序保留；不得把边界外的内容移入其中，也不得把区域内容移到边界外。默认翻译其中每个人类语言片段，包括作者编写的标签、注释、摘要、说明和描述，即使它们很短、单独占一行、看起来像终端输出，或与 URL、域名和标识符混合。允许翻译的自然语言可以按自然英文需要合并或拆分物理行，但区域不得为空或整体遗漏。保留机器值，但翻译其周围的人类语言说明。例如，将“中文站：”和“英文站：”译为“Chinese site:”和“English site:”，将“选择 Browser”译为“Select Browser”，并在保留域名的同时翻译“www.example.com：补丁正常输出”中的说明部分。只有当上下文明示某段原文措辞本身就是实际系统证据，修改它会造成事实错误时，才保留源语言；这项狭窄例外可用于确切界面标签、原始错误消息、原始日志或字面观测值。例如，周围正文说明“中文（中国）”是中文站实际显示的语言切换器标签时，应保留该文字。仅仅位于 Plaintext 区块、看起来像输出或只是短标签，都不足以保留源语言；无法确定自然语言片段用途时，应翻译。若 Plaintext 区域只包含 URL、域名、路径、命令、标识符、状态码或其他机器可读值，则仅将其用于理解上下文，内部文本必须逐字符原样复制且不得移动，并保持行序、行数、空行和缩进。无论区域是否允许翻译，URL、域名、路径、命令、参数、机器标识符、状态码和其他机器值都不得更改，也不得添加 Markdown 围栏或引号。
 
 匹配的 SWQALTSTART 与 SWQALTSTOP 之间是图片 alt 值，应自然、简洁地翻译，不得添加引号；外围图片标签会另行还原。
 

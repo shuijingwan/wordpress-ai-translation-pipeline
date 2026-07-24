@@ -48,6 +48,15 @@
 bash patch/run-featured-image-tests.sh
 ```
 
+Plaintext 区块完整性、受保护 Token 和相邻 Token 修复测试可通过以下命令运行：
+
+```bash
+php swq-plaintext-structure-test.php
+php swq-token-validation-test.php
+php swq-adjacent-token-repair-test.php
+php patch/token-normalization-tests.php
+```
+
 测试使用轻量 mock/stub 验证站点专用逻辑，不能替代与目标 WordPress、Polylang 和 SlyTranslate 版本一致的集成测试。
 
 ## 安全说明
