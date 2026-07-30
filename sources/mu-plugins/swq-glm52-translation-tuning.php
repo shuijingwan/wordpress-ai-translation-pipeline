@@ -2,7 +2,7 @@
 /**
  * Plugin Name: SWQ GLM-5.2 Translation Tuning
  * Description: Tunes GLM-5.2 requests and enables one-shot full-article translation for SlyTranslate with language-aware prompts, safe Plaintext translation, protected structures, and exact post-content persistence.
- * Version: 2026.07.24.18
+ * Version: 2026.07.30.19
  */
 
 defined( 'ABSPATH' ) || exit;
@@ -16,7 +16,8 @@ final class SWQ_GLM52_Translation_Tuning {
 	private const FULL_ARTICLE_TIMEOUT = 600;
 	private const FULL_ARTICLE_RUNAWAY_OUTPUT_RATIO = 6.0;
 	private const TRACE_FILE = '/tmp/swq-glm52-execution-trace.jsonl';
-	private const PROMPT_POLICY_VERSION = '2026-07-24-v12';
+	private const PROMPT_POLICY_VERSION = '2026-07-30-v13';
+	private const TRANSLATION_TAIL_GUARD = 'SWQTRANSLATIONTAILGUARDEND';
 	private const PROTECTED_TOKEN_REGEX = '/SWQ(?:BLOCK|INLINE|HTML|STRUCT|PLAINSTART|PLAINSTOP|ALTSTART|ALTSTOP)\d{6}END/';
 	private const PROTECTED_TOKEN_LIKE_REGEX = '/SWQ(?:BLOCK|INLINE|HTML|STRUCT|PLAINSTART|PLAINSTOP|ALTSTART|ALTSTOP)\d+END/';
 
@@ -1374,6 +1375,7 @@ final class SWQ_GLM52_Translation_Tuning {
 		}
 
 		$payload          = $protected['payload'];
+		$model_payload    = $payload . "\n" . self::TRANSLATION_TAIL_GUARD;
 		$map              = $protected['map'];
 		$plain_regions    = $protected['plain_regions'];
 		$alt_regions      = $protected['alt_regions'];
@@ -1397,7 +1399,7 @@ final class SWQ_GLM52_Translation_Tuning {
 			'post_id'         => $post_id,
 			'request_count'   => 0,
 			'request_model'   => '',
-			'payload_chars'   => self::char_length( $payload ),
+			'payload_chars'   => self::char_length( $model_payload ),
 			'protected_count' => count( $map ),
 			'max_tokens'      => 0,
 		];
@@ -1414,15 +1416,16 @@ final class SWQ_GLM52_Translation_Tuning {
 		self::trace_event(
 			'content_raw_started',
 			[
-				'payload_chars'   => self::char_length( $payload ),
+				'payload_chars'   => self::char_length( $model_payload ),
 				'protected_count' => count( $map ),
+				'translation_tail_guard_expected' => true,
 				'target_language' => $to,
 				'prompt_policy'   => self::PROMPT_POLICY_VERSION,
 			]
 		);
 
 		try {
-			$result = SlyTranslate\TranslationRuntime::translate_text_raw( $payload, $to, $from, $full_prompt );
+			$result = SlyTranslate\TranslationRuntime::translate_text_raw( $model_payload, $to, $from, $full_prompt );
 		} catch ( Throwable $throwable ) {
 			$result = new WP_Error( 'swq_full_article_exception', $throwable->getMessage() );
 		} finally {
@@ -1463,6 +1466,9 @@ final class SWQ_GLM52_Translation_Tuning {
 
 		$raw_model_response = (string) $result;
 		$translated_payload = self::unwrap_model_output( $raw_model_response );
+		$tail_guard         = self::remove_translation_tail_guard( $translated_payload );
+		$translated_payload = $tail_guard['translated'];
+		self::log_translation_tail_guard( $tail_guard );
 
 		preg_match_all( self::PROTECTED_TOKEN_REGEX, $payload, $source_token_matches );
 		$expected_tokens = isset( $source_token_matches[0] ) && is_array( $source_token_matches[0] )
@@ -1488,7 +1494,32 @@ final class SWQ_GLM52_Translation_Tuning {
 			$raw_model_response
 		);
 		if ( is_wp_error( $token_validation ) ) {
-			return $token_validation;
+			$tail_repair = self::repair_missing_struct_token_tail(
+				$translated_payload,
+				$expected_tokens,
+				$map
+			);
+
+			if ( ! $tail_repair['attempted'] ) {
+				self::log_protected_token_tail_repair( $tail_repair, 'not_run' );
+				return $token_validation;
+			}
+
+			$repaired_validation = self::validate_protected_tokens(
+				$tail_repair['translated'],
+				$expected_tokens,
+				$payload,
+				$map,
+				$raw_model_response
+			);
+			$revalidation_status = is_wp_error( $repaired_validation ) ? 'failed' : 'passed';
+			self::log_protected_token_tail_repair( $tail_repair, $revalidation_status );
+
+			if ( is_wp_error( $repaired_validation ) ) {
+				return $repaired_validation;
+			}
+
+			$translated_payload = $tail_repair['translated'];
 		}
 
 		$plaintext_validation = self::validate_plaintext_regions(
@@ -1514,6 +1545,10 @@ final class SWQ_GLM52_Translation_Tuning {
 		}
 
 		$restored = str_replace( array_keys( $map ), array_values( $map ), $restored_regions );
+
+		if ( str_contains( $restored, self::TRANSLATION_TAIL_GUARD ) ) {
+			return new WP_Error( 'swq_full_article_tail_guard_cleanup_failed', 'The internal translation tail guard remained after cleanup.' );
+		}
 
 		if ( preg_match( self::PROTECTED_TOKEN_REGEX, $restored ) ) {
 			return new WP_Error( 'swq_full_article_restore_failed', 'One or more protected tokens remained after restoration.' );
@@ -1545,7 +1580,9 @@ final class SWQ_GLM52_Translation_Tuning {
 
 
 	private static function protect_content( string $content ) {
-		if ( preg_match( self::PROTECTED_TOKEN_REGEX, $content ) ) {
+		if ( preg_match( self::PROTECTED_TOKEN_REGEX, $content )
+			|| str_contains( $content, self::TRANSLATION_TAIL_GUARD )
+		) {
 			return new WP_Error(
 				'swq_full_article_token_collision',
 				'The source content already contains a reserved protected token.'
@@ -2796,6 +2833,139 @@ final class SWQ_GLM52_Translation_Tuning {
 		return ! str_starts_with( $token, 'SWQINLINE' );
 	}
 
+	private static function remove_translation_tail_guard( string $translated ): array {
+		$count   = substr_count( $translated, self::TRANSLATION_TAIL_GUARD );
+		$trimmed = trim( $translated );
+		$status  = 'missing';
+
+		if ( 1 === $count ) {
+			$status = str_ends_with( $trimmed, self::TRANSLATION_TAIL_GUARD )
+				&& ! str_contains( $trimmed, '<slytranslate-output>' )
+				&& ! str_contains( $trimmed, '</slytranslate-output>' )
+				? 'present'
+				: 'misplaced';
+		} elseif ( $count > 1 ) {
+			$status = 'duplicate';
+		}
+
+		return [
+			'translation_tail_guard_expected' => true,
+			'translation_tail_guard_status'   => $status,
+			'translation_tail_guard_count'    => $count,
+			'translated'                      => trim( str_replace( self::TRANSLATION_TAIL_GUARD, '', $translated ) ),
+		];
+	}
+
+	private static function log_translation_tail_guard( array $diagnostic ): void {
+		$log_data = [
+			'translation_tail_guard_expected' => (bool) $diagnostic['translation_tail_guard_expected'],
+			'translation_tail_guard_status'   => (string) $diagnostic['translation_tail_guard_status'],
+			'translation_tail_guard_count'    => (int) $diagnostic['translation_tail_guard_count'],
+		];
+
+		self::trace_event( 'translation_tail_guard', $log_data );
+		error_log(
+			sprintf(
+				'[SWQ GLM-5.2 Full Article] translation_tail_guard_expected=%s translation_tail_guard_status=%s translation_tail_guard_count=%d',
+				$log_data['translation_tail_guard_expected'] ? 'true' : 'false',
+				$log_data['translation_tail_guard_status'],
+				$log_data['translation_tail_guard_count']
+			)
+		);
+	}
+
+	private static function repair_missing_struct_token_tail(
+		string $translated,
+		array $expected_tokens,
+		array $protected_map
+	): array {
+		preg_match_all( self::PROTECTED_TOKEN_REGEX, $translated, $matches );
+		$actual_tokens = isset( $matches[0] ) && is_array( $matches[0] ) ? $matches[0] : [];
+
+		$missing_tokens   = array_values( array_diff( $expected_tokens, $actual_tokens ) );
+		$extra_tokens     = array_values( array_diff( $actual_tokens, $expected_tokens ) );
+		$duplicate_tokens = array_filter(
+			array_count_values( $actual_tokens ),
+			static fn ( int $count ): bool => $count > 1
+		);
+		$result = [
+			'attempted'  => false,
+			'translated' => $translated,
+			'tokens'     => $missing_tokens,
+			'reason'     => '',
+		];
+
+		if ( [] === $missing_tokens ) {
+			$result['reason'] = 'no_missing_tokens';
+			return $result;
+		}
+		if ( [] !== $extra_tokens ) {
+			$result['reason'] = 'extra_tokens_present';
+			return $result;
+		}
+		if ( [] !== $duplicate_tokens ) {
+			$result['reason'] = 'duplicate_tokens_present';
+			return $result;
+		}
+		foreach ( $missing_tokens as $missing_token ) {
+			if ( 1 !== preg_match( '/^SWQSTRUCT\d{6}END$/', $missing_token ) ) {
+				$result['reason'] = 'missing_non_struct_token';
+				return $result;
+			}
+		}
+
+		$tail_count = count( $missing_tokens );
+		if ( $missing_tokens !== array_slice( $expected_tokens, -$tail_count ) ) {
+			$result['reason'] = 'missing_tokens_not_expected_tail_suffix';
+			return $result;
+		}
+		if ( $actual_tokens !== array_slice( $expected_tokens, 0, count( $expected_tokens ) - $tail_count ) ) {
+			$result['reason'] = 'actual_sequence_not_expected_prefix';
+			return $result;
+		}
+		foreach ( $missing_tokens as $missing_token ) {
+			if ( ! array_key_exists( $missing_token, $protected_map )
+				|| ! is_string( $protected_map[ $missing_token ] )
+			) {
+				$result['reason'] = 'protected_content_missing';
+				return $result;
+			}
+		}
+
+		$separator            = '' === $translated || 1 === preg_match( '/\s$/u', $translated ) ? '' : "\n";
+		$result['attempted']  = true;
+		$result['translated'] = $translated . $separator . implode( "\n", $missing_tokens );
+		$result['reason']     = 'eligible_tail_suffix';
+		return $result;
+	}
+
+	private static function log_protected_token_tail_repair( array $repair, string $revalidation ): void {
+		$diagnostic = [
+			'protected_token_tail_repair_attempted'    => (bool) $repair['attempted'],
+			'protected_token_tail_repair_count'        => $repair['attempted'] ? count( $repair['tokens'] ) : 0,
+			'protected_token_tail_repair_tokens'       => $repair['tokens'],
+			'protected_token_tail_repair_revalidation' => $revalidation,
+			'protected_token_tail_repair_reason'       => (string) $repair['reason'],
+		];
+
+		self::trace_event( 'protected_token_tail_repair', $diagnostic );
+		error_log(
+			'[SWQ GLM-5.2 Full Article] '
+			. implode(
+				' ',
+				array_map(
+					static fn ( string $key, $value ): string => $key . '=' . (
+						is_array( $value )
+							? (string) wp_json_encode( $value )
+							: ( is_bool( $value ) ? ( $value ? 'true' : 'false' ) : (string) $value )
+					),
+					array_keys( $diagnostic ),
+					array_values( $diagnostic )
+				)
+			)
+		);
+	}
+
 	private static function validate_protected_tokens(
 		string $translated,
 		array $expected_tokens,
@@ -3048,6 +3218,10 @@ final class SWQ_GLM52_Translation_Tuning {
 不可翻译的代码、行内代码、固定 HTML 元素、Gutenberg 区块边界以及部分可翻译区域已替换为受保护占位符。
 
 每个受保护占位符都必须逐字符原样复制，并且在输出中必须且只能出现一次。不得遗漏、重复、额外生成、复制、翻译、改名、拆开、包裹或重新编号任何占位符，也不得把一个段落中的占位符复制到另一个段落。占位符的类型、大小写和结尾必须保持不变；编号必须始终是固定 6 位数字，所有前导零都必须保留。
+
+特别检查输出尾部：输入末尾的每个受保护占位符，即使其前后没有任何自然语言，也必须逐个原样输出。输出 HTML closing tag 不代表任务已经完成；HTML 之后仍可能存在代表 Gutenberg closing comment 的 SWQSTRUCT Token。只有确认输入中的最后一个受保护占位符已经按原顺序输出后，才可以结束正文并输出 </slytranslate-output>。不得因为文章语义、HTML 或可见正文看起来已经结束而省略尾部占位符。
+
+SWQTRANSLATIONTAILGUARDEND 是内部完整性哨兵，不属于 WordPress 正文。它位于所有真实正文和受保护占位符之后，必须逐字符原样输出一次，并且必须保持在所有真实正文和受保护占位符之后、</slytranslate-output> 之前。不得翻译、改名、移动、重复或省略该哨兵。
 
 例如，SWQSTRUCT000018END、SWQBLOCK000018END、SWQINLINE000018END 和 SWQHTML000018END 必须完整保留。SWQSTRUCT000018END 不得写成 SWQSTRUCT00018END、SWQSTRUCT000018end、SWQSTRUCT 000018 END 或 SWQSTRUCT000 018END。不得在占位符内部插入空格、换行、标点、HTML 标签或 Markdown 格式。
 

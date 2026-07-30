@@ -54,6 +54,7 @@ Plaintext 区块完整性、受保护 Token 和相邻 Token 修复测试可通�
 php swq-plaintext-structure-test.php
 php swq-token-validation-test.php
 php swq-adjacent-token-repair-test.php
+php swq-tail-struct-token-repair-test.php
 php patch/token-normalization-tests.php
 ```
 
