@@ -20,7 +20,7 @@ class WP_Error {
 	public function get_error_data() { return $this->data; }
 }
 
-require __DIR__ . '/swq-glm52-translation-tuning.php';
+require __DIR__ . '/sources/mu-plugins/swq-glm52-translation-tuning.php';
 
 function invoke_plaintext_method( string $method, ...$args ) {
 	$reflection = new ReflectionMethod( 'SWQ_GLM52_Translation_Tuning', $method );
@@ -44,6 +44,21 @@ function protected_tokens( string $payload ): array {
 	);
 
 	return $matches[0] ?? [];
+}
+
+function code_block_pro( string $language, string $code ): string {
+	$attributes = json_encode(
+		[
+			'language' => $language,
+			'code'     => $code,
+			'codeHTML' => '',
+		],
+		JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES
+	);
+
+	return '<!-- wp:kevinbatdorf/code-block-pro ' . $attributes . ' -->'
+		. '<pre><code>' . htmlspecialchars( $code, ENT_QUOTES | ENT_HTML5, 'UTF-8' ) . '</code></pre>'
+		. '<!-- /wp:kevinbatdorf/code-block-pro -->';
 }
 
 $three_lines = "第一行\n第二行\n第三行";
@@ -156,5 +171,56 @@ $normal = '<!-- wp:paragraph --><p>普通中文段落。</p><!-- /wp:paragraph -
 $protected = invoke_plaintext_method( 'protect_content', $normal );
 $restored  = str_replace( array_keys( $protected['map'] ), array_values( $protected['map'] ), $protected['payload'] );
 plaintext_check( $normal === $restored, 'existing normal protection and restoration still pass' );
+
+$php_block = code_block_pro( 'php', '<?php echo "hello";' );
+$protected = invoke_plaintext_method( 'protect_content', $php_block );
+plaintext_check(
+	'SWQBLOCK000001END' === $protected['payload'] && [] === $protected['plain_regions'],
+	'PHP Code Block Pro remains a complete SWQBLOCK'
+);
+
+$han_block = code_block_pro( 'plaintext', "中文说明\n/path/to/file" );
+$protected = invoke_plaintext_method( 'protect_content', $han_block );
+plaintext_check(
+	str_contains( $protected['payload'], 'SWQPLAINSTART000001END' )
+		&& str_contains( $protected['payload'], '中文说明' )
+		&& 1 === count( $protected['plain_regions'] ),
+	'Plaintext Code Block Pro with Han text remains an editable SWQPLAIN region'
+);
+plaintext_check(
+	true === invoke_plaintext_method( 'validate_plaintext_regions', $protected['payload'], $protected['plain_regions'] ),
+	'Han Plaintext Code Block Pro retains existing structure validation'
+);
+
+$english_block = code_block_pro( 'text', "Release notes\nhttps://example.com/docs" );
+$protected = invoke_plaintext_method( 'protect_content', $english_block );
+plaintext_check(
+	'SWQBLOCK000001END' === $protected['payload']
+		&& ! str_contains( $protected['payload'], 'Release notes' )
+		&& [] === $protected['plain_regions'],
+	'English-only Plaintext Code Block Pro is hidden behind SWQBLOCK'
+);
+$restored = str_replace( array_keys( $protected['map'] ), array_values( $protected['map'] ), $protected['payload'] );
+plaintext_check(
+	$english_block === $restored,
+	'English-only Plaintext Code Block Pro restores byte-for-byte'
+);
+
+$machine_log_block = code_block_pro(
+	'txt',
+	"/var/log/nginx/access.log\n-rw-r--r-- 1 root root 4096 Aug 08 deploy.tar.gz\nstatus=500"
+);
+$protected = invoke_plaintext_method( 'protect_content', $machine_log_block );
+plaintext_check(
+	'SWQBLOCK000001END' === $protected['payload']
+		&& ! str_contains( $protected['payload'], '/var/log/nginx/access.log' )
+		&& [] === $protected['plain_regions'],
+	'machine log and file-list Plaintext Code Block Pro is hidden behind SWQBLOCK'
+);
+$restored = str_replace( array_keys( $protected['map'] ), array_values( $protected['map'] ), $protected['payload'] );
+plaintext_check(
+	$machine_log_block === $restored,
+	'machine log and file-list Plaintext Code Block Pro restores byte-for-byte'
+);
 
 echo "ALL TESTS PASSED\n";

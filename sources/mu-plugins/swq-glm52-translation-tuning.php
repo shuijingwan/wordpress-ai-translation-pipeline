@@ -1670,9 +1670,9 @@ final class SWQ_GLM52_Translation_Tuning {
 		/*
 		 * Code Block Pro blocks explicitly marked as Plaintext are special:
 		 * expose their readable contents to the model so surrounding prose can
-		 * be translated with the correct semantic context. Plaintext containing
-		 * Han text may be translated; Plaintext containing only machine data,
-		 * URLs, domains or identifiers is restored from the exact source text.
+		 * be translated with the correct semantic context. Only Plaintext containing
+		 * Han text is exposed to the model; Plaintext containing only machine data,
+		 * URLs, domains or identifiers remains a byte-for-byte protected block.
 		 * Other code languages remain protected byte-for-byte as complete blocks.
 		 */
 		$next = preg_replace_callback(
@@ -1681,12 +1681,11 @@ final class SWQ_GLM52_Translation_Tuning {
 				$block = (string) $matches[0];
 				$text  = self::extract_plaintext_code_block_pro_text( $block );
 
-				if ( null !== $text ) {
+				if ( null !== $text && self::contains_han_text( $text ) ) {
 					return $make_plain_region(
 						$block,
 						$text,
-						'code_block_pro',
-						! self::contains_han_text( $text )
+						'code_block_pro'
 					);
 				}
 
