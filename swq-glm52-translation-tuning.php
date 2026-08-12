@@ -1294,6 +1294,18 @@ final class SWQ_GLM52_Translation_Tuning {
 		if ( is_wp_error( $validation ) ) {
 			$error_code = (string) $validation->get_error_code();
 
+			if ( self::is_field_assistant_false_positive( $error_code, $source, $translated ) ) {
+				self::trace_event(
+					'field_assistant_validation_false_positive_bypassed',
+					[
+						'field'  => $field,
+						'unit_id' => $unit_id,
+						'signals' => self::broad_assistant_false_positive_signals( $source, $translated ),
+					]
+				);
+				return $translated;
+			}
+
 			if ( str_contains( $error_code, 'runaway' ) ) {
 				$source_length     = max( 1, self::char_length( $source ) );
 				$translated_length = self::char_length( $translated );
@@ -1314,6 +1326,34 @@ final class SWQ_GLM52_Translation_Tuning {
 		}
 
 		return $translated;
+	}
+
+	/**
+	 * The generic validator treats any new occurrence of the word "critical"
+	 * as prompt leakage. That is too broad for ordinary technical prose (for
+	 * example, "critical warnings"). Keep the field-level exception narrower
+	 * than the full-article compatibility path: only the standalone ordinary
+	 * critical-word signal is bypassed, and only when no strong prompt marker
+	 * is present.
+	 */
+	private static function is_field_assistant_false_positive( string $error_code, string $source, string $translated ): bool {
+		if ( 'invalid_translation_assistant_reply' !== $error_code ) {
+			return false;
+		}
+
+		$strong_markers = self::strong_prompt_leakage_markers( $source, $translated );
+		if ( ! empty( $strong_markers ) ) {
+			return false;
+		}
+
+		if ( 1 === preg_match( '/\bcritical\s*:/iu', $translated )
+			|| 1 === preg_match( '/\bcritical\s+(?:output|instruction|instructions|rule|rules|translation|format|return|apply|keep|obey)\b/iu', $translated ) ) {
+			return false;
+		}
+
+		$signals = self::broad_assistant_false_positive_signals( $source, $translated );
+
+		return [ 'ordinary_critical_word' ] === $signals;
 	}
 
 	private static function wrap_field_error(
