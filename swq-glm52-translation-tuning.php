@@ -1611,10 +1611,25 @@ final class SWQ_GLM52_Translation_Tuning {
 			return new WP_Error( 'swq_full_article_restore_failed', 'One or more protected tokens remained after restoration.' );
 		}
 
-		if ( self::paragraph_run_block_signature( $content ) !== self::paragraph_run_block_signature( $restored ) ) {
+		$source_signature   = self::paragraph_run_block_signature( $content );
+		$restored_signature = self::paragraph_run_block_signature( $restored );
+		if ( $source_signature !== $restored_signature ) {
+			$diagnostic = self::paragraph_run_structure_drift_diagnostic(
+				$content,
+				$restored,
+				$post_id,
+				$source_signature,
+				$restored_signature
+			);
+			self::write_validation_diagnostic_files(
+				'/tmp/swq-glm52-gutenberg-structure-drift-summary.json',
+				'/tmp/swq-glm52-gutenberg-structure-drift-restored.txt',
+				$diagnostic,
+				$restored
+			);
 			return new WP_Error(
 				'swq_full_article_gutenberg_structure_drift',
-				'The Gutenberg block structure changed during full-article translation.'
+				'The Gutenberg block structure changed during full-article translation. Diagnostic: /tmp/swq-glm52-gutenberg-structure-drift-summary.json'
 			);
 		}
 
@@ -3546,6 +3561,10 @@ final class SWQ_GLM52_Translation_Tuning {
 	}
 
 	private static function paragraph_run_block_signature( string $content ): array {
+		return array_column( self::paragraph_run_block_signature_items( $content ), 'signature' );
+	}
+
+	private static function paragraph_run_block_signature_items( string $content ): array {
 		if ( ! function_exists( 'parse_blocks' ) ) {
 			return [];
 		}
@@ -3553,13 +3572,22 @@ final class SWQ_GLM52_Translation_Tuning {
 		if ( ! is_array( $blocks ) ) {
 			return [];
 		}
-		$signature = [];
-		$walk = static function ( array $items, int $depth ) use ( &$walk, &$signature ): void {
+		$items = [];
+		$walk = static function ( array $nested_blocks, int $depth, ?string $parent_name ) use ( &$walk, &$items ): void {
 			$in_paragraph_run = false;
-			foreach ( $items as $block ) {
+			foreach ( $nested_blocks as $block ) {
 				if ( 0 === $depth && self::is_safe_top_level_paragraph_block( $block ) ) {
 					if ( ! $in_paragraph_run ) {
-						$signature[] = '0:PARAGRAPH_RUN';
+						$items[] = [
+							'signature'        => '0:PARAGRAPH_RUN',
+							'depth'            => 0,
+							'block_name'       => 'core/paragraph',
+							'normalized'       => 'PARAGRAPH_RUN',
+							'is_paragraph_run' => true,
+							'has_attributes'   => false,
+							'attributes'       => [],
+							'parent_name'      => null,
+						];
 						$in_paragraph_run = true;
 					}
 					continue;
@@ -3567,15 +3595,83 @@ final class SWQ_GLM52_Translation_Tuning {
 				$in_paragraph_run = false;
 				$name = isset( $block['blockName'] ) && is_string( $block['blockName'] ) ? trim( $block['blockName'] ) : '';
 				if ( '' !== $name ) {
-					$signature[] = $depth . ':' . $name . ':' . hash( 'sha256', wp_json_encode( $block['attrs'] ?? [] ) ?: '' );
+					$raw_attributes = $block['attrs'] ?? [];
+					$attributes = is_array( $raw_attributes ) ? $raw_attributes : [];
+					$items[] = [
+						'signature'        => $depth . ':' . $name . ':' . hash( 'sha256', wp_json_encode( $raw_attributes ) ?: '' ),
+						'depth'            => $depth,
+						'block_name'       => $name,
+						'normalized'       => null,
+						'is_paragraph_run' => false,
+						'has_attributes'   => [] !== $attributes,
+						'attributes'       => $attributes,
+						'parent_name'      => $parent_name,
+					];
 				}
 				if ( isset( $block['innerBlocks'] ) && is_array( $block['innerBlocks'] ) && ! empty( $block['innerBlocks'] ) ) {
-					$walk( $block['innerBlocks'], $depth + 1 );
+					$walk( $block['innerBlocks'], $depth + 1, '' !== $name ? $name : $parent_name );
 				}
 			}
 		};
-		$walk( $blocks, 0 );
-		return $signature;
+		$walk( $blocks, 0, null );
+		return $items;
+	}
+
+	private static function paragraph_run_structure_drift_diagnostic(
+		string $source,
+		string $restored,
+		int $post_id,
+		array $source_signature,
+		array $restored_signature
+	): array {
+		$source_items   = self::paragraph_run_block_signature_items( $source );
+		$restored_items = self::paragraph_run_block_signature_items( $restored );
+		$max_count      = max( count( $source_signature ), count( $restored_signature ) );
+		$first_mismatch = null;
+		for ( $index = 0; $index < $max_count; $index++ ) {
+			if ( ( $source_signature[ $index ] ?? null ) !== ( $restored_signature[ $index ] ?? null ) ) {
+				$first_mismatch = $index;
+				break;
+			}
+		}
+		if ( null === $first_mismatch ) {
+			$first_mismatch = 0;
+		}
+
+		$context = static function ( array $items, int $index ): array {
+			$start = max( 0, $index - 5 );
+			$end   = min( count( $items ), $index + 6 );
+			$result = [];
+			for ( $cursor = $start; $cursor < $end; $cursor++ ) {
+				$item           = $items[ $cursor ];
+				$item['index']  = $cursor;
+				$result[]       = $item;
+			}
+			return $result;
+		};
+		$item = static function ( array $items, int $index ): array {
+			if ( ! isset( $items[ $index ] ) ) {
+				return [ 'status' => 'EOF', 'index' => $index ];
+			}
+			$result          = $items[ $index ];
+			$result['index'] = $index;
+			return $result;
+		};
+
+		return [
+			'post_id'                    => $post_id,
+			'error_code'                 => 'swq_full_article_gutenberg_structure_drift',
+			'source_signature_count'     => count( $source_signature ),
+			'restored_signature_count'   => count( $restored_signature ),
+			'first_mismatch_index'       => $first_mismatch,
+			'previous_matching_item'     => $first_mismatch > 0 ? $item( $source_items, $first_mismatch - 1 ) : [ 'status' => 'BOF', 'index' => -1 ],
+			'source_item_at_mismatch'    => $item( $source_items, $first_mismatch ),
+			'restored_item_at_mismatch'  => $item( $restored_items, $first_mismatch ),
+			'source_signature'           => $source_signature,
+			'restored_signature'         => $restored_signature,
+			'source_signature_context'   => $context( $source_items, $first_mismatch ),
+			'restored_signature_context' => $context( $restored_items, $first_mismatch ),
+		];
 	}
 
 	private static function build_field_prompt(

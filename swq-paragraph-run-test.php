@@ -59,6 +59,9 @@ function protect( string $content ): array { return para_invoke( 'protect_conten
 function validate_runs( string $payload, array $runs ) { return para_invoke( 'validate_paragraph_runs', $payload, $runs ); }
 function restore_runs( string $payload, array $runs ) { return para_invoke( 'restore_paragraph_runs', $payload, $runs ); }
 
+@unlink( '/tmp/swq-glm52-gutenberg-structure-drift-summary.json' );
+@unlink( '/tmp/swq-glm52-gutenberg-structure-drift-restored.txt' );
+
 $source = para( 'A' ) . para( 'B' ) . block( 'heading', '<h2>H</h2>' ) . para( 'C' ) . para( 'D' );
 $protected = protect( $source );
 para_check( 2 === count( $protected['paragraph_runs'] ), 'heading separates two top-level paragraph runs' );
@@ -164,6 +167,43 @@ para_check( is_wp_error( para_invoke( 'validate_protected_tokens', $fixed_source
 $signature_source = para( 'A' ) . para( 'B' ) . block( 'heading', '<h2>H</h2>' ) . para( 'C' ) . para( 'D' );
 $signature_target = para( 'A and B' ) . block( 'heading', '<h2>H</h2>' ) . para( 'C' ) . para( 'D' ) . para( 'E' );
 para_check( para_invoke( 'paragraph_run_block_signature', $signature_source ) === para_invoke( 'paragraph_run_block_signature', $signature_target ), 'normalized signature accepts paragraph count changes within separate runs' );
+
+$same_signature = para_invoke( 'paragraph_run_block_signature', $signature_source );
+para_check( $same_signature === para_invoke( 'paragraph_run_block_signature', $signature_source ), 'matching normalized signatures do not drift' );
+para_check( ! file_exists( '/tmp/swq-glm52-gutenberg-structure-drift-summary.json' ) && ! file_exists( '/tmp/swq-glm52-gutenberg-structure-drift-restored.txt' ), 'matching signatures do not create drift diagnostics' );
+
+$drift_source = para( 'A' ) . block( 'heading', '<h2>H</h2>' ) . block( 'quote', '<blockquote><p>Q</p></blockquote>' ) . para( 'B' );
+$drift_restored = para( 'A' ) . block( 'quote', '<blockquote><p>Q</p></blockquote>' ) . para( 'B' );
+$drift_source_signature = para_invoke( 'paragraph_run_block_signature', $drift_source );
+$drift_restored_signature = para_invoke( 'paragraph_run_block_signature', $drift_restored );
+$drift = para_invoke( 'paragraph_run_structure_drift_diagnostic', $drift_source, $drift_restored, 25425, $drift_source_signature, $drift_restored_signature );
+para_check( 1 === $drift['first_mismatch_index'], 'fixed heading omission reports the first mismatch index' );
+para_check( '0:core/heading:' . hash( 'sha256', '[]' ) === $drift['source_item_at_mismatch']['signature'], 'heading omission reports the source fixed block' );
+para_check( '0:core/quote:' . hash( 'sha256', '[]' ) === $drift['restored_item_at_mismatch']['signature'], 'heading omission reports the restored fixed block' );
+para_check( 'core/heading' === $drift['source_item_at_mismatch']['block_name'] && 'core/quote' === $drift['restored_item_at_mismatch']['block_name'], 'drift items include readable block names' );
+para_check( 4 === count( $drift['source_signature_context'] ) && 3 === count( $drift['restored_signature_context'] ), 'drift context includes neighboring items' );
+
+$quote_source = para( 'A' ) . block( 'quote', '<blockquote><p>Q</p></blockquote>' ) . para( 'B' );
+$quote_restored = para( 'A' ) . para( 'B' );
+$quote_drift = para_invoke(
+	'paragraph_run_structure_drift_diagnostic',
+	$quote_source,
+	$quote_restored,
+	25425,
+	para_invoke( 'paragraph_run_block_signature', $quote_source ),
+	para_invoke( 'paragraph_run_block_signature', $quote_restored )
+);
+para_check( 'core/quote' === $quote_drift['source_item_at_mismatch']['block_name'] && 'EOF' === $quote_drift['restored_item_at_mismatch']['status'], 'quote loss and restored EOF are explicit in drift diagnostics' );
+
+$candidate_file = '/tmp/swq-paragraph-run-diagnostic-candidate.txt';
+$summary_file = '/tmp/swq-paragraph-run-diagnostic-summary.json';
+@unlink( $candidate_file );
+@unlink( $summary_file );
+para_invoke( 'write_validation_diagnostic_files', $summary_file, $candidate_file, $drift, $drift_restored );
+para_check( $drift_restored === file_get_contents( $candidate_file ), 'drift candidate file contains the post-restore Gutenberg candidate' );
+para_check( 0600 === ( fileperms( $candidate_file ) & 0777 ) && 0600 === ( fileperms( $summary_file ) & 0777 ), 'drift diagnostics use restrictive permissions' );
+@unlink( $candidate_file );
+@unlink( $summary_file );
 
 $prompt = para_invoke( 'build_content_prompt', 'en' );
 para_check( str_contains( $prompt, 'SWQPARARUNSTART' ) && str_contains( $prompt, '一个或多个顶层且无 attributes 的 <p>' ), 'prompt contains paragraph-run rules' );
