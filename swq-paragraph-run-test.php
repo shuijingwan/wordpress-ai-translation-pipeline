@@ -14,16 +14,37 @@ class WP_Error {
 
 /* This compact fixture parser supplies the top-level AST facts used by this test. */
 function parse_blocks( string $content ): array {
-	preg_match_all( '~<!--\s+wp:([A-Za-z0-9_/-]+)(?:\s+(\{.*?\}))?\s+-->(.*?)<!--\s+/wp:\1\s+-->~su', $content, $matches, PREG_SET_ORDER );
+	preg_match_all( '~<!--\s+wp:([A-Za-z0-9_/-]+)(?:\s+(\{.*?\}))?\s+-->(.*?)<!--\s+/wp:\1\s+-->~su', $content, $matches, PREG_SET_ORDER | PREG_OFFSET_CAPTURE );
 	$blocks = [];
+	$cursor = 0;
 	foreach ( $matches as $match ) {
-		$name = str_contains( $match[1], '/' ) ? $match[1] : 'core/' . $match[1];
-		$attrs = '' === ( $match[2] ?? '' ) ? [] : ( json_decode( $match[2], true ) ?: [ '_invalid' => true ] );
+		$offset = (int) $match[0][1];
+		$freeform = substr( $content, $cursor, $offset - $cursor );
+		if ( '' !== $freeform ) {
+			$blocks[] = [
+				'blockName' => null,
+				'attrs' => [],
+				'innerBlocks' => [],
+				'innerHTML' => $freeform,
+			];
+		}
+		$name = str_contains( $match[1][0], '/' ) ? $match[1][0] : 'core/' . $match[1][0];
+		$attrs = '' === ( $match[2][0] ?? '' ) ? [] : ( json_decode( $match[2][0], true ) ?: [ '_invalid' => true ] );
 		$blocks[] = [
 			'blockName' => $name,
 			'attrs' => $attrs,
 			'innerBlocks' => [],
-			'innerHTML' => $match[3],
+			'innerHTML' => $match[3][0],
+		];
+		$cursor = $offset + strlen( $match[0][0] );
+	}
+	$freeform = substr( $content, $cursor );
+	if ( '' !== $freeform ) {
+		$blocks[] = [
+			'blockName' => null,
+			'attrs' => [],
+			'innerBlocks' => [],
+			'innerHTML' => $freeform,
 		];
 	}
 	return $blocks;
@@ -47,8 +68,8 @@ function para( string $text, string $attrs = '' ): string {
 function block( string $name, string $html ): string {
 	return '<!-- wp:' . $name . ' -->' . $html . '<!-- /wp:' . $name . ' -->';
 }
-function code_block_pro( string $language, string $code ): string {
-	$attributes = json_encode( [ 'language' => $language, 'code' => $code, 'codeHTML' => '' ], JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES );
+function code_block_pro( string $language, string $code, array $extra_attributes = [] ): string {
+	$attributes = json_encode( array_merge( [ 'language' => $language, 'code' => $code, 'codeHTML' => '' ], $extra_attributes ), JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES );
 	return '<!-- wp:kevinbatdorf/code-block-pro ' . $attributes . ' --><pre><code>' . htmlspecialchars( $code, ENT_QUOTES | ENT_HTML5, 'UTF-8' ) . '</code></pre><!-- /wp:kevinbatdorf/code-block-pro -->';
 }
 function para_tokens( string $payload ): array {
@@ -167,6 +188,31 @@ para_check( is_wp_error( para_invoke( 'validate_protected_tokens', $fixed_source
 $signature_source = para( 'A' ) . para( 'B' ) . block( 'heading', '<h2>H</h2>' ) . para( 'C' ) . para( 'D' );
 $signature_target = para( 'A and B' ) . block( 'heading', '<h2>H</h2>' ) . para( 'C' ) . para( 'D' ) . para( 'E' );
 para_check( para_invoke( 'paragraph_run_block_signature', $signature_source ) === para_invoke( 'paragraph_run_block_signature', $signature_target ), 'normalized signature accepts paragraph count changes within separate runs' );
+
+$plaintext_signature_source = code_block_pro( 'plaintext', "正文 A\n正文 B", [ 'codeHTML' => '<pre>中文</pre>', 'highestLineNumber' => 2, 'theme' => 'one-dark', 'lineNumbers' => true ] );
+$plaintext_signature_restored = code_block_pro( 'plaintext', "Body A\nBody B\nBody C", [ 'codeHTML' => '<pre>English</pre>', 'highestLineNumber' => 3, 'theme' => 'one-dark', 'lineNumbers' => true ] );
+para_check( para_invoke( 'paragraph_run_block_signature', $plaintext_signature_source ) === para_invoke( 'paragraph_run_block_signature', $plaintext_signature_restored ), 'Plaintext Code Block Pro content attributes are normalized after restoration' );
+$plaintext_theme_changed = code_block_pro( 'plaintext', "Body A\nBody B\nBody C", [ 'codeHTML' => '<pre>English</pre>', 'highestLineNumber' => 3, 'theme' => 'github-light', 'lineNumbers' => true ] );
+para_check( para_invoke( 'paragraph_run_block_signature', $plaintext_signature_source ) !== para_invoke( 'paragraph_run_block_signature', $plaintext_theme_changed ), 'Plaintext Code Block Pro non-content configuration remains strict' );
+$plaintext_line_numbers_changed = code_block_pro( 'plaintext', "Body A\nBody B\nBody C", [ 'codeHTML' => '<pre>English</pre>', 'highestLineNumber' => 3, 'theme' => 'one-dark', 'lineNumbers' => false ] );
+para_check( para_invoke( 'paragraph_run_block_signature', $plaintext_signature_source ) !== para_invoke( 'paragraph_run_block_signature', $plaintext_line_numbers_changed ), 'Plaintext Code Block Pro line-number configuration remains strict' );
+$plaintext_language_changed = code_block_pro( 'php', "Body A\nBody B\nBody C", [ 'codeHTML' => '<pre>English</pre>', 'highestLineNumber' => 3, 'theme' => 'one-dark', 'lineNumbers' => true ] );
+para_check( para_invoke( 'paragraph_run_block_signature', $plaintext_signature_source ) !== para_invoke( 'paragraph_run_block_signature', $plaintext_language_changed ), 'Plaintext Code Block Pro language remains strict' );
+$non_plaintext_signature_source = code_block_pro( 'php', '<?php echo "中文";', [ 'theme' => 'one-dark' ] );
+$non_plaintext_signature_restored = code_block_pro( 'php', '<?php echo "English";', [ 'theme' => 'one-dark' ] );
+para_check( para_invoke( 'paragraph_run_block_signature', $non_plaintext_signature_source ) !== para_invoke( 'paragraph_run_block_signature', $non_plaintext_signature_restored ), 'non-Plaintext Code Block Pro attributes remain fully strict' );
+
+$whitespace_run_source = para( 'A' ) . "\n \t\n" . para( 'B' );
+$whitespace_run_restored = para( 'A and B' );
+para_check( [ '0:PARAGRAPH_RUN' ] === para_invoke( 'paragraph_run_block_signature', $whitespace_run_source ), 'whitespace-only freeform does not split a paragraph run' );
+para_check( para_invoke( 'paragraph_run_block_signature', $whitespace_run_source ) === para_invoke( 'paragraph_run_block_signature', $whitespace_run_restored ), 'different whitespace-only freeform representation does not drift' );
+$meaningful_freeform = para( 'A' ) . '<div class="legacy">Visible freeform HTML</div>' . para( 'B' );
+$meaningful_freeform_signature = para_invoke( 'paragraph_run_block_signature', $meaningful_freeform );
+para_check( 3 === count( $meaningful_freeform_signature ) && str_contains( $meaningful_freeform_signature[1], ':FREEFORM:' ), 'meaningful freeform HTML has its own strict signature item' );
+$separator_signature = para( 'A' ) . block( 'separator', '<hr class="wp-block-separator">' ) . para( 'B' );
+para_check( 3 === count( para_invoke( 'paragraph_run_block_signature', $separator_signature ) ), 'separator remains a strict paragraph-run boundary' );
+$quote_signature = para( 'A' ) . block( 'quote', '<blockquote><p>Q</p></blockquote>' ) . para( 'B' );
+para_check( 3 === count( para_invoke( 'paragraph_run_block_signature', $quote_signature ) ), 'quote remains a strict paragraph-run boundary' );
 
 $same_signature = para_invoke( 'paragraph_run_block_signature', $signature_source );
 para_check( $same_signature === para_invoke( 'paragraph_run_block_signature', $signature_source ), 'matching normalized signatures do not drift' );

@@ -2268,6 +2268,11 @@ final class SWQ_GLM52_Translation_Tuning {
 		return is_array( $attributes ) ? $attributes : [];
 	}
 
+	private static function is_plaintext_code_block_pro_attributes( array $attributes ): bool {
+		$language = strtolower( trim( (string) ( $attributes['language'] ?? '' ) ) );
+		return in_array( $language, [ 'plaintext', 'plain', 'text', 'txt' ], true );
+	}
+
 	private static function extract_pre_element_text( string $html ): ?string {
 		if ( ! preg_match( '~<pre\b[^>]*>(.*?)</pre\s*>~isu', $html, $matches ) ) {
 			return null;
@@ -3592,13 +3597,17 @@ final class SWQ_GLM52_Translation_Tuning {
 					}
 					continue;
 				}
-				$in_paragraph_run = false;
 				$name = isset( $block['blockName'] ) && is_string( $block['blockName'] ) ? trim( $block['blockName'] ) : '';
+				if ( '' === $name && self::is_ignorable_paragraph_run_signature_freeform( $block ) ) {
+					continue;
+				}
+				$in_paragraph_run = false;
 				if ( '' !== $name ) {
 					$raw_attributes = $block['attrs'] ?? [];
 					$attributes = is_array( $raw_attributes ) ? $raw_attributes : [];
+					$signature_attributes = self::paragraph_run_signature_attributes( $name, $raw_attributes );
 					$items[] = [
-						'signature'        => $depth . ':' . $name . ':' . hash( 'sha256', wp_json_encode( $raw_attributes ) ?: '' ),
+						'signature'        => $depth . ':' . $name . ':' . hash( 'sha256', wp_json_encode( $signature_attributes ) ?: '' ),
 						'depth'            => $depth,
 						'block_name'       => $name,
 						'normalized'       => null,
@@ -3606,6 +3615,20 @@ final class SWQ_GLM52_Translation_Tuning {
 						'has_attributes'   => [] !== $attributes,
 						'attributes'       => $attributes,
 						'parent_name'      => $parent_name,
+					];
+				} else {
+					$freeform_content = self::paragraph_run_signature_freeform_content( $block );
+					$items[] = [
+						'signature'        => $depth . ':FREEFORM:' . hash( 'sha256', $freeform_content ),
+						'depth'            => $depth,
+						'block_name'       => null,
+						'normalized'       => 'FREEFORM',
+						'is_paragraph_run' => false,
+						'has_attributes'   => false,
+						'attributes'       => [],
+						'parent_name'      => $parent_name,
+						'content_sha256'   => hash( 'sha256', $freeform_content ),
+						'content_chars'    => self::char_length( $freeform_content ),
 					];
 				}
 				if ( isset( $block['innerBlocks'] ) && is_array( $block['innerBlocks'] ) && ! empty( $block['innerBlocks'] ) ) {
@@ -3615,6 +3638,34 @@ final class SWQ_GLM52_Translation_Tuning {
 		};
 		$walk( $blocks, 0, null );
 		return $items;
+	}
+
+	private static function paragraph_run_signature_attributes( string $block_name, $attributes ) {
+		if ( 'kevinbatdorf/code-block-pro' !== $block_name || ! is_array( $attributes ) || ! self::is_plaintext_code_block_pro_attributes( $attributes ) ) {
+			return $attributes;
+		}
+		$normalized = $attributes;
+		unset( $normalized['code'], $normalized['codeHTML'], $normalized['highestLineNumber'] );
+		return $normalized;
+	}
+
+	private static function is_ignorable_paragraph_run_signature_freeform( $block ): bool {
+		if ( ! is_array( $block ) || ! empty( $block['innerBlocks'] ?? [] ) ) {
+			return false;
+		}
+		return 1 === preg_match( '/^\s*$/u', self::paragraph_run_signature_freeform_content( $block ) );
+	}
+
+	private static function paragraph_run_signature_freeform_content( array $block ): string {
+		$content = isset( $block['innerHTML'] ) && is_string( $block['innerHTML'] ) ? $block['innerHTML'] : '';
+		if ( '' === $content && isset( $block['innerContent'] ) && is_array( $block['innerContent'] ) ) {
+			foreach ( $block['innerContent'] as $part ) {
+				if ( is_string( $part ) ) {
+					$content .= $part;
+				}
+			}
+		}
+		return $content;
 	}
 
 	private static function paragraph_run_structure_drift_diagnostic(
