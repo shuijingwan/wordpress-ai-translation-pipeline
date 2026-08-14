@@ -2959,8 +2959,22 @@ final class SWQ_GLM52_Translation_Tuning {
 			$result['reason'] = 'missing_tokens_not_expected_tail_suffix';
 			return $result;
 		}
-		if ( $actual_tokens !== array_slice( $expected_tokens, 0, count( $expected_tokens ) - $tail_count ) ) {
-			$result['reason'] = 'actual_sequence_not_expected_prefix';
+
+		$expected_fixed_tokens = array_values(
+			array_filter(
+				$expected_tokens,
+				[ self::class, 'is_fixed_order_protected_token' ]
+			)
+		);
+		$actual_fixed_tokens = array_values(
+			array_filter(
+				$actual_tokens,
+				[ self::class, 'is_fixed_order_protected_token' ]
+			)
+		);
+
+		if ( $actual_fixed_tokens !== array_slice( $expected_fixed_tokens, 0, count( $actual_fixed_tokens ) ) ) {
+			$result['reason'] = 'actual_fixed_sequence_not_expected_prefix';
 			return $result;
 		}
 		foreach ( $missing_tokens as $missing_token ) {

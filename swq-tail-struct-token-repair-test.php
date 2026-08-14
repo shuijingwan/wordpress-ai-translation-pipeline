@@ -95,12 +95,45 @@ $result = tail_repair( tail_payload( [ $s455, $s456, $s457, $s457 ] ), $expected
 tail_check( false === $result['attempted'] && 'duplicate_tokens_present' === $result['reason'], 'F duplicate token prevents repair' );
 
 $result = tail_repair( tail_payload( [ $s456, $s455, $s457 ] ), $expected );
-tail_check( false === $result['attempted'] && 'actual_sequence_not_expected_prefix' === $result['reason'], 'G token order error prevents repair' );
+tail_check( false === $result['attempted'] && 'actual_fixed_sequence_not_expected_prefix' === $result['reason'], 'G fixed token order error prevents repair' );
 
 $inline = tail_token( 'INLINE', 1 );
 $non_struct_tail = [ $s455, $s456, $inline ];
 $result = tail_repair( tail_payload( [ $s455, $s456 ] ), $non_struct_tail );
 tail_check( false === $result['attempted'] && 'missing_non_struct_token' === $result['reason'], 'H non-STRUCT tail token prevents repair' );
+
+$inline_1   = tail_token( 'INLINE', 59 );
+$inline_2   = tail_token( 'INLINE', 60 );
+$struct_a   = tail_token( 'STRUCT', 708 );
+$struct_b   = tail_token( 'STRUCT', 709 );
+$struct_c   = tail_token( 'STRUCT', 710 );
+$struct_tail = tail_token( 'STRUCT', 942 );
+$inline_reorder_expected = [ $struct_a, $inline_1, $inline_2, $struct_b, $struct_tail ];
+$inline_reorder_actual   = tail_payload( [ $struct_a, $inline_2, $inline_1, $struct_b ] );
+$result = tail_repair( $inline_reorder_actual, $inline_reorder_expected );
+tail_check( true === $result['attempted'], 'INLINE reordering with only a trailing STRUCT missing triggers repair' );
+tail_check(
+	true === invoke_tail_method( 'validate_protected_tokens', $result['translated'], $inline_reorder_expected, tail_payload( $inline_reorder_expected ), tail_map( $inline_reorder_expected ), $result['translated'] ),
+	'INLINE reordering repair passes completeness and fixed-order validation'
+);
+
+$fixed_middle_expected = [ $struct_a, $inline_1, $struct_b, $struct_c ];
+$result = tail_repair( tail_payload( [ $struct_a, $inline_1, $struct_c ] ), $fixed_middle_expected );
+tail_check( false === $result['attempted'], 'Fixed token missing from the middle is rejected' );
+
+$fixed_reorder_expected = [ $struct_a, $struct_b, $struct_c, $struct_tail ];
+$result = tail_repair( tail_payload( [ $struct_a, $struct_c, $struct_b ] ), $fixed_reorder_expected );
+tail_check( false === $result['attempted'] && 'actual_fixed_sequence_not_expected_prefix' === $result['reason'], 'Fixed token reordering is rejected' );
+
+$result = tail_repair( tail_payload( [ $struct_a, $inline_2, $struct_b ] ), $inline_reorder_expected );
+tail_check( false === $result['attempted'] && 'missing_non_struct_token' === $result['reason'], 'INLINE reordering with a missing INLINE token is rejected' );
+
+$unknown_extra = tail_token( 'HTML', 999 );
+$result = tail_repair( tail_payload( [ $struct_a, $inline_2, $inline_1, $struct_b, $unknown_extra ] ), $inline_reorder_expected );
+tail_check( false === $result['attempted'] && 'extra_tokens_present' === $result['reason'], 'Unknown extra token prevents repair despite INLINE reordering' );
+
+$result = tail_repair( tail_payload( [ $struct_a, $inline_2, $inline_1, $inline_1, $struct_b ] ), $inline_reorder_expected );
+tail_check( false === $result['attempted'] && 'duplicate_tokens_present' === $result['reason'], 'Duplicate INLINE token prevents repair' );
 
 $map_without_tail = tail_map( $expected );
 unset( $map_without_tail[ $s458 ] );
