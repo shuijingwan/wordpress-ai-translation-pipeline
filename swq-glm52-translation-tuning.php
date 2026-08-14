@@ -18,8 +18,8 @@ final class SWQ_GLM52_Translation_Tuning {
 	private const TRACE_FILE = '/tmp/swq-glm52-execution-trace.jsonl';
 	private const PROMPT_POLICY_VERSION = '2026-07-30-v13';
 	private const TRANSLATION_TAIL_GUARD = 'SWQTRANSLATIONTAILGUARDEND';
-	private const PROTECTED_TOKEN_REGEX = '/SWQ(?:BLOCK|INLINE|HTML|STRUCT|PLAINSTART|PLAINSTOP|ALTSTART|ALTSTOP)\d{6}END/';
-	private const PROTECTED_TOKEN_LIKE_REGEX = '/SWQ(?:BLOCK|INLINE|HTML|STRUCT|PLAINSTART|PLAINSTOP|ALTSTART|ALTSTOP)\d+END/';
+	private const PROTECTED_TOKEN_REGEX = '/SWQ(?:BLOCK|INLINE|HTML|STRUCT|PARARUNSTART|PARARUNSTOP|PLAINSTART|PLAINSTOP|ALTSTART|ALTSTOP)\d{6}END/';
+	private const PROTECTED_TOKEN_LIKE_REGEX = '/SWQ(?:BLOCK|INLINE|HTML|STRUCT|PARARUNSTART|PARARUNSTOP|PLAINSTART|PLAINSTOP|ALTSTART|ALTSTOP)\d+END/';
 
 	private static array $state = [
 		'active'          => false,
@@ -1419,6 +1419,7 @@ final class SWQ_GLM52_Translation_Tuning {
 		$map              = $protected['map'];
 		$plain_regions    = $protected['plain_regions'];
 		$alt_regions      = $protected['alt_regions'];
+		$paragraph_runs   = $protected['paragraph_runs'];
 		$prompt_parts = [];
 
 		if ( '' !== trim( $additional_prompt ) ) {
@@ -1562,6 +1563,14 @@ final class SWQ_GLM52_Translation_Tuning {
 			$translated_payload = $tail_repair['translated'];
 		}
 
+		$paragraph_run_validation = self::validate_paragraph_runs(
+			$translated_payload,
+			$paragraph_runs
+		);
+		if ( is_wp_error( $paragraph_run_validation ) ) {
+			return $paragraph_run_validation;
+		}
+
 		$plaintext_validation = self::validate_plaintext_regions(
 			$translated_payload,
 			$plain_regions
@@ -1575,8 +1584,16 @@ final class SWQ_GLM52_Translation_Tuning {
 			return $translation_validation;
 		}
 
-		$restored_regions = self::restore_translatable_regions(
+		$restored_paragraph_runs = self::restore_paragraph_runs(
 			$translated_payload,
+			$paragraph_runs
+		);
+		if ( is_wp_error( $restored_paragraph_runs ) ) {
+			return $restored_paragraph_runs;
+		}
+
+		$restored_regions = self::restore_translatable_regions(
+			$restored_paragraph_runs,
 			$plain_regions,
 			$alt_regions
 		);
@@ -1594,7 +1611,7 @@ final class SWQ_GLM52_Translation_Tuning {
 			return new WP_Error( 'swq_full_article_restore_failed', 'One or more protected tokens remained after restoration.' );
 		}
 
-		if ( self::block_signature( $content ) !== self::block_signature( $restored ) ) {
+		if ( self::paragraph_run_block_signature( $content ) !== self::paragraph_run_block_signature( $restored ) ) {
 			return new WP_Error(
 				'swq_full_article_gutenberg_structure_drift',
 				'The Gutenberg block structure changed during full-article translation.'
@@ -1629,9 +1646,10 @@ final class SWQ_GLM52_Translation_Tuning {
 			);
 		}
 
-		$map            = [];
-		$plain_regions  = [];
-		$alt_regions    = [];
+		$map              = [];
+		$plain_regions    = [];
+		$alt_regions      = [];
+		$paragraph_runs   = [];
 		$block_index    = 0;
 		$inline_index   = 0;
 		$html_index     = 0;
@@ -1873,6 +1891,8 @@ final class SWQ_GLM52_Translation_Tuning {
 			$payload = $next;
 		}
 
+		$payload = self::replace_safe_paragraph_runs( $payload, $paragraph_runs );
+
 		/*
 		 * Gutenberg block comments are non-translatable structural boundaries.
 		 * Replace every remaining opening and closing block comment with an
@@ -1894,11 +1914,300 @@ final class SWQ_GLM52_Translation_Tuning {
 		$payload = $next;
 
 		return [
-			'payload'       => $payload,
-			'map'           => $map,
-			'plain_regions' => $plain_regions,
-			'alt_regions'   => $alt_regions,
+			'payload'        => $payload,
+			'map'            => $map,
+			'plain_regions'  => $plain_regions,
+			'alt_regions'    => $alt_regions,
+			'paragraph_runs' => $paragraph_runs,
 		];
+	}
+
+	private static function replace_safe_paragraph_runs( string $payload, array &$paragraph_runs ): string {
+		$candidates = self::safe_top_level_paragraph_candidates( $payload );
+		if ( [] === $candidates ) {
+			return $payload;
+		}
+
+		$runs = [];
+		$current = [];
+		foreach ( $candidates as $candidate ) {
+			if ( [] !== $current && ! preg_match( '/^\s*$/u', substr( $payload, (int) $current[ count( $current ) - 1 ]['end'], (int) $candidate['start'] - (int) $current[ count( $current ) - 1 ]['end'] ) ) ) {
+				$runs[] = $current;
+				$current = [];
+			}
+			$current[] = $candidate;
+		}
+		if ( [] !== $current ) {
+			$runs[] = $current;
+		}
+
+		for ( $index = count( $runs ) - 1; $index >= 0; $index-- ) {
+			$run = $runs[ $index ];
+			$id = $index + 1;
+			$start_token = sprintf( 'SWQPARARUNSTART%06dEND', $id );
+			$stop_token = sprintf( 'SWQPARARUNSTOP%06dEND', $id );
+			$html = implode( "\n", array_column( $run, 'html' ) );
+			$replacement = $start_token . "\n" . $html . "\n" . $stop_token;
+			$start = (int) $run[0]['start'];
+			$end = (int) $run[ count( $run ) - 1 ]['end'];
+			$payload = substr_replace( $payload, $replacement, $start, $end - $start );
+			array_unshift( $paragraph_runs, [
+				'id' => $id,
+				'start_token' => $start_token,
+				'stop_token' => $stop_token,
+			] );
+		}
+
+		return $payload;
+	}
+
+	private static function safe_top_level_paragraph_candidates( string $payload ): array {
+		if ( ! function_exists( 'parse_blocks' ) ) {
+			return [];
+		}
+		$blocks = parse_blocks( $payload );
+		if ( ! is_array( $blocks ) ) {
+			return [];
+		}
+		$expected = [];
+		foreach ( $blocks as $block ) {
+			if ( self::is_safe_top_level_paragraph_block( $block ) ) {
+				$expected[] = trim( (string) $block['innerHTML'] );
+			}
+		}
+		if ( [] === $expected ) {
+			return [];
+		}
+
+		preg_match_all( '~<!--\s*(/?)wp:([A-Za-z0-9_/-]+)(.*?)-->~su', $payload, $matches, PREG_OFFSET_CAPTURE );
+		$stack = [];
+		$candidates = [];
+		foreach ( $matches[0] as $index => $match ) {
+			$comment = (string) $match[0];
+			$offset = (int) $match[1];
+			$closing = '/' === (string) $matches[1][ $index ][0];
+			$name = (string) $matches[2][ $index ][0];
+			$tail = trim( (string) $matches[3][ $index ][0] );
+			$self_closing = ! $closing && str_ends_with( $tail, '/' );
+			$attributes = trim( $self_closing ? substr( $tail, 0, -1 ) : $tail );
+			if ( $self_closing ) {
+				continue;
+			}
+			if ( ! $closing ) {
+				$stack[] = [
+					'name' => $name,
+					'attributes' => $attributes,
+					'start' => $offset,
+					'content_start' => $offset + strlen( $comment ),
+					'depth' => count( $stack ),
+				];
+				continue;
+			}
+			$opening = array_pop( $stack );
+			if ( ! is_array( $opening ) || $name !== $opening['name'] ) {
+				return [];
+			}
+			if ( 0 !== $opening['depth'] || 'paragraph' !== $name || '' !== $opening['attributes'] ) {
+				continue;
+			}
+			$html = substr( $payload, (int) $opening['content_start'], $offset - (int) $opening['content_start'] );
+			if ( ! self::is_safe_paragraph_html( $html ) ) {
+				continue;
+			}
+			$candidates[] = [
+				'start' => (int) $opening['start'],
+				'end' => $offset + strlen( $comment ),
+				'html' => trim( $html ),
+			];
+		}
+		if ( [] !== $stack || count( $expected ) !== count( $candidates ) ) {
+			return [];
+		}
+		foreach ( $candidates as $index => $candidate ) {
+			if ( $expected[ $index ] !== $candidate['html'] ) {
+				return [];
+			}
+		}
+		return $candidates;
+	}
+
+	private static function is_safe_top_level_paragraph_block( $block ): bool {
+		if ( ! is_array( $block )
+			|| 'core/paragraph' !== (string) ( $block['blockName'] ?? '' )
+			|| ! empty( $block['attrs'] ?? [] )
+			|| ! empty( $block['innerBlocks'] ?? [] )
+		) {
+			return false;
+		}
+		return self::is_safe_paragraph_html( (string) ( $block['innerHTML'] ?? '' ) );
+	}
+
+	private static function is_safe_paragraph_html( string $html ): bool {
+		if ( ! preg_match( '~^\s*<p>(.*?)</p>\s*$~su', $html, $matches ) ) {
+			return false;
+		}
+		$inner = (string) $matches[1];
+		if ( preg_match( '~<!--\s*/?wp:|<\/?(?:p|h[1-6]|ul|ol|li|figure|blockquote|table|pre|img)\b~iu', $inner )
+			|| self::contains_shortcode_markup( $inner )
+		) {
+			return false;
+		}
+		preg_match_all( self::PROTECTED_TOKEN_REGEX, $inner, $token_matches );
+		foreach ( $token_matches[0] ?? [] as $token ) {
+			if ( ! str_starts_with( (string) $token, 'SWQINLINE' ) ) {
+				return false;
+			}
+		}
+		return true;
+	}
+
+	private static function contains_shortcode_markup( string $html ): bool {
+		return 1 === preg_match( '/\[[A-Za-z][A-Za-z0-9_-]*(?:\s[^\]]*)?\]/u', $html );
+	}
+
+	private static function validate_paragraph_runs( string $payload, array $paragraph_runs ) {
+		if ( [] === $paragraph_runs ) {
+			return true;
+		}
+		$expected_markers = [];
+		foreach ( $paragraph_runs as $run ) {
+			$expected_markers[] = (string) ( $run['start_token'] ?? '' );
+			$expected_markers[] = (string) ( $run['stop_token'] ?? '' );
+		}
+		preg_match_all( '/SWQPARARUN(?:START|STOP)\d{6}END/', $payload, $matches );
+		if ( $expected_markers !== ( $matches[0] ?? [] ) ) {
+			return new WP_Error( 'swq_full_article_paragraph_run_boundary_drift', 'Paragraph-run boundaries were missing, reordered, nested, or crossed.' );
+		}
+		foreach ( $paragraph_runs as $run ) {
+			$region = self::extract_paragraph_run_region( $payload, $run );
+			if ( is_wp_error( $region ) ) {
+				return $region;
+			}
+			$validation = self::validate_paragraph_run_html( (string) $region['html'] );
+			if ( is_wp_error( $validation ) ) {
+				return $validation;
+			}
+		}
+		return true;
+	}
+
+	private static function restore_paragraph_runs( string $payload, array $paragraph_runs ) {
+		foreach ( $paragraph_runs as $run ) {
+			$region = self::extract_paragraph_run_region( $payload, $run );
+			if ( is_wp_error( $region ) ) {
+				return $region;
+			}
+			$paragraphs = self::paragraph_run_paragraphs( (string) $region['html'] );
+			if ( is_wp_error( $paragraphs ) ) {
+				return $paragraphs;
+			}
+			$replacement = implode(
+				"\n\n",
+				array_map(
+					static fn ( string $paragraph ): string => "<!-- wp:paragraph -->\n" . $paragraph . "\n<!-- /wp:paragraph -->",
+					$paragraphs
+				)
+			);
+			$payload = substr_replace( $payload, $replacement, (int) $region['offset'], (int) $region['length'] );
+		}
+		return $payload;
+	}
+
+	private static function extract_paragraph_run_region( string $payload, array $run ) {
+		$start = (string) ( $run['start_token'] ?? '' );
+		$stop = (string) ( $run['stop_token'] ?? '' );
+		if ( '' === $start || '' === $stop ) {
+			return new WP_Error( 'swq_full_article_paragraph_run_invalid', 'A paragraph-run marker was invalid.' );
+		}
+		$pattern = '~' . preg_quote( $start, '~' ) . '\s*(.*?)\s*' . preg_quote( $stop, '~' ) . '~su';
+		if ( ! preg_match( $pattern, $payload, $matches, PREG_OFFSET_CAPTURE ) ) {
+			return new WP_Error( 'swq_full_article_paragraph_run_missing', sprintf( 'Could not restore the paragraph run beginning with %s.', $start ) );
+		}
+		return [
+			'html' => (string) $matches[1][0],
+			'offset' => (int) $matches[0][1],
+			'length' => strlen( (string) $matches[0][0] ),
+		];
+	}
+
+	private static function validate_paragraph_run_html( string $html ) {
+		if ( preg_match( '~<!--\s*/?wp:|SWQSTRUCT|SWQPARARUN(?:START|STOP)~iu', $html ) ) {
+			return new WP_Error( 'swq_full_article_paragraph_run_forbidden_structure', 'A paragraph run contained Gutenberg or paragraph-run structure.' );
+		}
+		preg_match_all( self::PROTECTED_TOKEN_REGEX, $html, $token_matches );
+		foreach ( $token_matches[0] ?? [] as $token ) {
+			if ( ! str_starts_with( (string) $token, 'SWQINLINE' ) ) {
+				return new WP_Error( 'swq_full_article_paragraph_run_protected_region', 'A paragraph run contained a non-inline protected region.' );
+			}
+		}
+		$paragraphs = self::paragraph_run_paragraphs( $html );
+		if ( is_wp_error( $paragraphs ) ) {
+			return $paragraphs;
+		}
+		foreach ( $paragraphs as $paragraph ) {
+			if ( ! self::inline_html_is_balanced( substr( $paragraph, 3, -4 ) ) ) {
+				return new WP_Error( 'swq_full_article_paragraph_run_html_invalid', 'A paragraph run contained malformed inline HTML.' );
+			}
+		}
+		return true;
+	}
+
+	private static function paragraph_run_paragraphs( string $html ) {
+		if ( preg_match( '~<\/?(?:h[1-6]|ul|ol|li|figure|blockquote|table|pre|img)\b~iu', $html ) ) {
+			return new WP_Error( 'swq_full_article_paragraph_run_block_element', 'A paragraph run contained a forbidden block-level element.' );
+		}
+		preg_match_all( '~<p>(.*?)</p>~su', $html, $matches, PREG_OFFSET_CAPTURE );
+		if ( empty( $matches[0] ) ) {
+			return new WP_Error( 'swq_full_article_paragraph_run_empty', 'A paragraph run did not contain a top-level paragraph.' );
+		}
+		$cursor = 0;
+		$paragraphs = [];
+		foreach ( $matches[0] as $index => $match ) {
+			$offset = (int) $match[1];
+			if ( ! preg_match( '/^\s*$/u', substr( $html, $cursor, $offset - $cursor ) ) ) {
+				return new WP_Error( 'swq_full_article_paragraph_run_root_invalid', 'A paragraph run contained non-paragraph root content.' );
+			}
+			$paragraph = (string) $match[0];
+			$inner = (string) $matches[1][ $index ][0];
+			if ( preg_match( '~<\/?p\b~iu', $inner ) ) {
+				return new WP_Error( 'swq_full_article_paragraph_run_nested_paragraph', 'A paragraph run contained a nested paragraph.' );
+			}
+			$paragraphs[] = $paragraph;
+			$cursor = $offset + strlen( $paragraph );
+		}
+		if ( ! preg_match( '/^\s*$/u', substr( $html, $cursor ) ) ) {
+			return new WP_Error( 'swq_full_article_paragraph_run_root_invalid', 'A paragraph run contained non-paragraph trailing content.' );
+		}
+		return $paragraphs;
+	}
+
+	private static function inline_html_is_balanced( string $html ): bool {
+		$allowed = [ 'a', 'abbr', 'b', 'cite', 'code', 'del', 'em', 'i', 'ins', 'kbd', 'mark', 'q', 's', 'small', 'span', 'strong', 'sub', 'sup', 'time', 'u', 'var' ];
+		$void = [ 'br', 'wbr' ];
+		preg_match_all( '~<(/?)([A-Za-z][A-Za-z0-9:-]*)(?:\s+[^<>]*)?\s*(/?)>~s', $html, $matches );
+		$stack = [];
+		foreach ( $matches[0] as $index => $tag ) {
+			$name = strtolower( (string) $matches[2][ $index ] );
+			$closing = '/' === (string) $matches[1][ $index ];
+			$self_closing = '/' === (string) $matches[3][ $index ];
+			if ( ! in_array( $name, $allowed, true ) && ! in_array( $name, $void, true ) ) {
+				return false;
+			}
+			if ( in_array( $name, $void, true ) || $self_closing ) {
+				if ( $closing ) {
+					return false;
+				}
+				continue;
+			}
+			if ( $closing ) {
+				if ( $name !== array_pop( $stack ) ) {
+					return false;
+				}
+			} else {
+				$stack[] = $name;
+			}
+		}
+		return [] === $stack;
 	}
 
 	private static function contains_han_text( string $text ): bool {
@@ -3236,6 +3545,39 @@ final class SWQ_GLM52_Translation_Tuning {
 		return $signature;
 	}
 
+	private static function paragraph_run_block_signature( string $content ): array {
+		if ( ! function_exists( 'parse_blocks' ) ) {
+			return [];
+		}
+		$blocks = parse_blocks( $content );
+		if ( ! is_array( $blocks ) ) {
+			return [];
+		}
+		$signature = [];
+		$walk = static function ( array $items, int $depth ) use ( &$walk, &$signature ): void {
+			$in_paragraph_run = false;
+			foreach ( $items as $block ) {
+				if ( 0 === $depth && self::is_safe_top_level_paragraph_block( $block ) ) {
+					if ( ! $in_paragraph_run ) {
+						$signature[] = '0:PARAGRAPH_RUN';
+						$in_paragraph_run = true;
+					}
+					continue;
+				}
+				$in_paragraph_run = false;
+				$name = isset( $block['blockName'] ) && is_string( $block['blockName'] ) ? trim( $block['blockName'] ) : '';
+				if ( '' !== $name ) {
+					$signature[] = $depth . ':' . $name . ':' . hash( 'sha256', wp_json_encode( $block['attrs'] ?? [] ) ?: '' );
+				}
+				if ( isset( $block['innerBlocks'] ) && is_array( $block['innerBlocks'] ) && ! empty( $block['innerBlocks'] ) ) {
+					$walk( $block['innerBlocks'], $depth + 1 );
+				}
+			}
+		};
+		$walk( $blocks, 0 );
+		return $signature;
+	}
+
 	private static function build_field_prompt(
 		string $additional_prompt,
 		string $field,
@@ -3287,13 +3629,15 @@ SWQHTML 开头的占位符代表固定 HTML 元素，必须逐字符原样保留
 
 SWQSTRUCT 开头的占位符代表原始 Gutenberg 起始或结束区块注释，是不可移动的区块边界。必须保持完整 SWQSTRUCT 序列的数量、顺序和位置，不得交换相邻结构 Token、删除区块边界，或把一个结构区间中的内容移动到另一个结构区间。
 
+匹配的 SWQPARARUNSTART 与 SWQPARARUNSTOP 表示一个顶层、无 attributes 的连续普通 paragraph 区域。每个 START/STOP Token 必须逐字符原样保留一次，不得遗漏、重复、改名、移动、嵌套或交叉。该区域内必须输出一个或多个顶层且无 attributes 的 <p>...</p>；为自然目标语言表达可合并或拆分这些普通 paragraph。不得在区域内输出 Gutenberg block comment、heading、list、image、quote、table、pre、code block 或其他 block-level 元素；不得把区域内容移到 START/STOP 之外，也不得把固定区块内容移入区域。
+
 匹配的 SWQPLAINSTART 与 SWQPLAINSTOP 之间的文本来自 Plaintext 或预格式化区块。每一对 START/STOP 是不可移动的区块级边界，必须完整、唯一、按编号顺序保留；不得把边界外的内容移入其中，也不得把区域内容移到边界外。默认翻译其中每个人类语言片段，包括作者编写的标签、注释、摘要、说明和描述，即使它们很短、单独占一行、看起来像终端输出，或与 URL、域名和标识符混合。允许翻译的自然语言可以按自然英文需要合并或拆分物理行，但区域不得为空或整体遗漏。保留机器值，但翻译其周围的人类语言说明。例如，将“中文站：”和“英文站：”译为“Chinese site:”和“English site:”，将“选择 Browser”译为“Select Browser”，并在保留域名的同时翻译“www.example.com：补丁正常输出”中的说明部分。只有当上下文明示某段原文措辞本身就是实际系统证据，修改它会造成事实错误时，才保留源语言；这项狭窄例外可用于确切界面标签、原始错误消息、原始日志或字面观测值。例如，周围正文说明“中文（中国）”是中文站实际显示的语言切换器标签时，应保留该文字。仅仅位于 Plaintext 区块、看起来像输出或只是短标签，都不足以保留源语言；无法确定自然语言片段用途时，应翻译。若 Plaintext 区域只包含 URL、域名、路径、命令、标识符、状态码或其他机器可读值，则仅将其用于理解上下文，内部文本必须逐字符原样复制且不得移动，并保持行序、行数、空行和缩进。无论区域是否允许翻译，URL、域名、路径、命令、参数、机器标识符、状态码和其他机器值都不得更改，也不得添加 Markdown 围栏或引号。
 
 匹配的 SWQALTSTART 与 SWQALTSTOP 之间是图片 alt 值，应自然、简洁地翻译，不得添加引号；外围图片标签会另行还原。
 
 原始 Gutenberg 区块注释由 SWQSTRUCT 表示；其余输入仍包含 HTML 标签及属性、区块属性、URL、域名、短代码、模板变量和文档结构。所有这些内容以及命令、参数、配置键、路径、文件名、标识符、产品名和插件名都必须原样保留。
 
-原文中的每个自然语言段落只能翻译一次。不得重复、遗漏、合并、拆分、替换或重新排列 Gutenberg 区块、HTML 元素、段落、标题、列表项、表格单元格或章节；保持其层级、相对顺序和文档位置。不得把前一个段落的译文复制到相邻段落。即使两个相邻段落内容相似，也必须分别翻译并保留各自结构；不得因前后文相似而跳过其中任何一个段落，也不得自行补充源内容中不存在的段落、标题、说明或总结。
+原文中的每个自然语言内容只能翻译一次。不得重复、遗漏、替换或重新排列 Gutenberg 区块、HTML 元素、标题、列表项、表格单元格或章节；保持其层级、相对顺序和文档位置。普通 paragraph 仅可在同一个 SWQPARARUN 内按上述规则合并或拆分，绝不得跨越固定结构或另一个 paragraph run 移动内容。不得把前一个结构区间的译文复制到相邻区间，也不得自行补充源内容中不存在的内容。
 
 在同一个标题、段落、列表项或表格单元格内部，可以根据自然英文表达需要调整句子结构、主语、修饰语和从句，但不得跨越原有结构边界移动内容。
 
