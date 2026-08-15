@@ -3776,7 +3776,7 @@ SWQHTML 开头的占位符代表固定 HTML 元素，必须逐字符原样保留
 
 SWQSTRUCT 开头的占位符代表原始 Gutenberg 起始或结束区块注释，是不可移动的区块边界。必须保持完整 SWQSTRUCT 序列的数量、顺序和位置，不得交换相邻结构 Token、删除区块边界，或把一个结构区间中的内容移动到另一个结构区间。
 
-匹配的 SWQPARARUNSTART 与 SWQPARARUNSTOP 表示一个顶层、无 attributes 的连续普通 paragraph 区域。每个 START/STOP Token 必须逐字符原样保留一次，不得遗漏、重复、改名、移动、嵌套或交叉。该区域内必须输出一个或多个顶层且无 attributes 的 <p>...</p>；为自然目标语言表达可合并或拆分这些普通 paragraph。不得在区域内输出 Gutenberg block comment、heading、list、image、quote、table、pre、code block 或其他 block-level 元素；不得把区域内容移到 START/STOP 之外，也不得把固定区块内容移入区域。
+匹配的 SWQPARARUNSTART 与 SWQPARARUNSTOP 表示一个顶层、无 attributes 的连续普通 paragraph 区域。每个 START/STOP Token 必须逐字符原样保留一次，不得遗漏、重复、改名、移动、嵌套或交叉。该区域内必须输出一个或多个顶层且无 attributes 的 <p>...</p>；为自然目标语言表达可合并或拆分这些普通 paragraph。合并或拆分时必须保持句子及其标点完整，不得产生空 paragraph，也不得留下仅包含句号、逗号、冒号、分号、括号或其他标点符号的独立 paragraph；如果自然语言内容被合并到相邻 paragraph，对应标点也必须随内容保留在合适的 paragraph 中。不得在区域内输出 Gutenberg block comment、heading、list、image、quote、table、pre、code block 或其他 block-level 元素；不得把区域内容移到 START/STOP 之外，也不得把固定区块内容移入区域。
 
 匹配的 SWQPLAINSTART 与 SWQPLAINSTOP 之间的文本来自 Plaintext 或预格式化区块。每一对 START/STOP 是不可移动的区块级边界，必须完整、唯一、按编号顺序保留；不得把边界外的内容移入其中，也不得把区域内容移到边界外。默认翻译其中每个人类语言片段，包括作者编写的标签、注释、摘要、说明和描述，即使它们很短、单独占一行、看起来像终端输出，或与 URL、域名和标识符混合。允许翻译的自然语言可以按自然英文需要合并或拆分物理行，但区域不得为空或整体遗漏。保留机器值，但翻译其周围的人类语言说明。例如，将“中文站：”和“英文站：”译为“Chinese site:”和“English site:”，将“选择 Browser”译为“Select Browser”，并在保留域名的同时翻译“www.example.com：补丁正常输出”中的说明部分。只有当上下文明示某段原文措辞本身就是实际系统证据，修改它会造成事实错误时，才保留源语言；这项狭窄例外可用于确切界面标签、原始错误消息、原始日志或字面观测值。例如，周围正文说明“中文（中国）”是中文站实际显示的语言切换器标签时，应保留该文字。仅仅位于 Plaintext 区块、看起来像输出或只是短标签，都不足以保留源语言；无法确定自然语言片段用途时，应翻译。若 Plaintext 区域只包含 URL、域名、路径、命令、标识符、状态码或其他机器可读值，则仅将其用于理解上下文，内部文本必须逐字符原样复制且不得移动，并保持行序、行数、空行和缩进。无论区域是否允许翻译，URL、域名、路径、命令、参数、机器标识符、状态码和其他机器值都不得更改，也不得添加 Markdown 围栏或引号。
 

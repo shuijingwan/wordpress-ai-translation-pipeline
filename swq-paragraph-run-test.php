@@ -253,5 +253,6 @@ para_check( 0600 === ( fileperms( $candidate_file ) & 0777 ) && 0600 === ( filep
 
 $prompt = para_invoke( 'build_content_prompt', 'en' );
 para_check( str_contains( $prompt, 'SWQPARARUNSTART' ) && str_contains( $prompt, '一个或多个顶层且无 attributes 的 <p>' ), 'prompt contains paragraph-run rules' );
+para_check( str_contains( $prompt, '不得留下仅包含句号、逗号、冒号、分号、括号或其他标点符号的独立 paragraph' ), 'prompt forbids punctuation-only standalone paragraphs' );
 
 echo "ALL TESTS PASSED\n";
