@@ -1626,15 +1626,16 @@ final class SWQ_GLM52_Translation_Tuning {
 				$source_signature,
 				$restored_signature
 			);
+			$diagnostic_paths = self::gutenberg_structure_drift_diagnostic_paths( $post_id );
 			self::write_validation_diagnostic_files(
-				'/tmp/swq-glm52-gutenberg-structure-drift-summary.json',
-				'/tmp/swq-glm52-gutenberg-structure-drift-restored.txt',
+				$diagnostic_paths['summary'],
+				$diagnostic_paths['restored'],
 				$diagnostic,
 				$restored
 			);
 			return new WP_Error(
 				'swq_full_article_gutenberg_structure_drift',
-				'The Gutenberg block structure changed during full-article translation. Diagnostic: /tmp/swq-glm52-gutenberg-structure-drift-summary.json'
+				sprintf( 'The Gutenberg block structure changed during full-article translation. Diagnostic: %s', $diagnostic_paths['summary'] )
 			);
 		}
 
@@ -2082,7 +2083,18 @@ final class SWQ_GLM52_Translation_Tuning {
 	}
 
 	private static function contains_shortcode_markup( string $html ): bool {
-		return 1 === preg_match( '/\[[A-Za-z][A-Za-z0-9_-]*(?:\s[^\]]*)?\]/u', $html );
+		if ( ! function_exists( 'shortcode_exists' ) ) {
+			return 1 === preg_match( '/\[[A-Za-z][A-Za-z0-9_-]*(?:\s[^\]]*)?\]/u', $html );
+		}
+
+		preg_match_all( '/\[(?:\/)?([A-Za-z][A-Za-z0-9_-]*)(?=[\s\]\/])/u', $html, $matches );
+		foreach ( $matches[1] ?? [] as $tag ) {
+			if ( shortcode_exists( (string) $tag ) ) {
+				return true;
+			}
+		}
+
+		return false;
 	}
 
 	private static function validate_paragraph_runs( string $payload, array $paragraph_runs ) {
@@ -2191,6 +2203,13 @@ final class SWQ_GLM52_Translation_Tuning {
 			$inner = (string) $matches[1][ $index ][0];
 			if ( preg_match( '~<\/?p\b~iu', $inner ) ) {
 				return new WP_Error( 'swq_full_article_paragraph_run_nested_paragraph', 'A paragraph run contained a nested paragraph.' );
+			}
+			$plain = html_entity_decode( strip_tags( $inner ), ENT_QUOTES | ENT_HTML5, 'UTF-8' );
+			if ( '' === trim( $plain ) ) {
+				return new WP_Error( 'swq_full_article_paragraph_run_empty_paragraph', 'A paragraph run contained an empty paragraph.' );
+			}
+			if ( 1 === preg_match( '/^[\p{P}\p{Z}\s]+$/u', $plain ) ) {
+				return new WP_Error( 'swq_full_article_paragraph_run_punctuation_only', 'A paragraph run contained a punctuation-only paragraph.' );
 			}
 			$paragraphs[] = $paragraph;
 			$cursor = $offset + strlen( $paragraph );
@@ -3671,6 +3690,16 @@ final class SWQ_GLM52_Translation_Tuning {
 			}
 		}
 		return $content;
+	}
+
+	private static function gutenberg_structure_drift_diagnostic_paths( int $post_id ): array {
+		$safe_post_id = max( 0, $post_id );
+		$prefix       = sprintf( '/tmp/swq-glm52-gutenberg-structure-drift-%d', $safe_post_id );
+
+		return [
+			'summary'  => $prefix . '-summary.json',
+			'restored' => $prefix . '-restored.txt',
+		];
 	}
 
 	private static function paragraph_run_structure_drift_diagnostic(

@@ -5,6 +5,7 @@ define( 'ABSPATH', __DIR__ . '/' );
 function add_filter( ...$args ): void {}
 function wp_json_encode( $value, int $flags = 0 ) { return json_encode( $value, $flags ); }
 function is_wp_error( $value ): bool { return $value instanceof WP_Error; }
+function shortcode_exists( string $tag ): bool { return in_array( $tag, [ 'gallery', 'contact-form-7' ], true ); }
 class WP_Error {
 	public function __construct( private string $code = '', private string $message = '', private $data = null ) {}
 	public function get_error_code(): string { return $this->code; }
@@ -118,6 +119,17 @@ $group_inner = protect( block( 'group', '<div>' . para( 'G' ) . '</div>' ) );
 para_check( [] === $group_inner['paragraph_runs'], 'group-internal paragraph does not form a run' );
 $shortcode = protect( para( 'Before [gallery id="1"] after' ) );
 para_check( [] === $shortcode['paragraph_runs'], 'shortcode paragraph remains on the strict STRUCT path' );
+$plain_brackets_source = para( '【订阅号与服务号认证后均可用】' );
+$plain_brackets_restored = para( '[available for both subscription and service accounts after authentication]' );
+para_check( 1 === count( protect( $plain_brackets_restored )['paragraph_runs'] ), 'ordinary ASCII bracketed prose forms a paragraph run' );
+para_check(
+	para_invoke( 'paragraph_run_block_signature', $plain_brackets_source ) === para_invoke( 'paragraph_run_block_signature', $plain_brackets_restored ),
+	'post 5050 full-width brackets translated to ordinary ASCII brackets keep the paragraph-run signature'
+);
+$registered_shortcode_without_attributes = protect( para( 'Before [gallery] after' ) );
+para_check( [] === $registered_shortcode_without_attributes['paragraph_runs'], 'registered shortcode without attributes remains on the strict STRUCT path' );
+$registered_shortcode_pair = protect( para( 'Before [contact-form-7]form[/contact-form-7] after' ) );
+para_check( [] === $registered_shortcode_pair['paragraph_runs'], 'registered enclosing shortcode remains on the strict STRUCT path' );
 
 $protected = protect( para( 'A' ) . para( 'B' ) );
 $run = $protected['paragraph_runs'][0];
@@ -139,6 +151,9 @@ para_check( true === validate_runs( $three_to_two, $protected['paragraph_runs'] 
 
 foreach ( [
 	'zero paragraphs' => "\n",
+	'empty paragraph' => '<p></p>',
+	'whitespace-only paragraph' => '<p> &nbsp; </p>',
+	'punctuation-only paragraph' => '<p>.,:;()【】</p>',
 	'nested paragraph' => '<p>Outer <p>Inner</p></p>',
 	'paragraph attributes' => '<p class="x">A</p>',
 	'Gutenberg comment' => '<!-- wp:paragraph --><p>A</p><!-- /wp:paragraph -->',
@@ -250,6 +265,15 @@ para_check( $drift_restored === file_get_contents( $candidate_file ), 'drift can
 para_check( 0600 === ( fileperms( $candidate_file ) & 0777 ) && 0600 === ( fileperms( $summary_file ) & 0777 ), 'drift diagnostics use restrictive permissions' );
 @unlink( $candidate_file );
 @unlink( $summary_file );
+
+$post_5050_paths = para_invoke( 'gutenberg_structure_drift_diagnostic_paths', 5050 );
+$post_5079_paths = para_invoke( 'gutenberg_structure_drift_diagnostic_paths', 5079 );
+para_check(
+	'/tmp/swq-glm52-gutenberg-structure-drift-5050-summary.json' === $post_5050_paths['summary']
+		&& '/tmp/swq-glm52-gutenberg-structure-drift-5050-restored.txt' === $post_5050_paths['restored'],
+	'Gutenberg structure drift diagnostics include the post ID'
+);
+para_check( $post_5050_paths !== $post_5079_paths, 'different posts cannot overwrite each other structure drift diagnostics' );
 
 $prompt = para_invoke( 'build_content_prompt', 'en' );
 para_check( str_contains( $prompt, 'SWQPARARUNSTART' ) && str_contains( $prompt, '一个或多个顶层且无 attributes 的 <p>' ), 'prompt contains paragraph-run rules' );
