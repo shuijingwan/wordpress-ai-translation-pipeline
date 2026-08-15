@@ -1329,12 +1329,12 @@ final class SWQ_GLM52_Translation_Tuning {
 	}
 
 	/**
-	 * The generic validator treats any new occurrence of the word "critical"
-	 * as prompt leakage. That is too broad for ordinary technical prose (for
-	 * example, "critical warnings"). Keep the field-level exception narrower
-	 * than the full-article compatibility path: only the standalone ordinary
-	 * critical-word signal is bypassed, and only when no strong prompt marker
-	 * is present.
+	 * The generic validator treats any new occurrence of the words "critical"
+	 * or "mandatory" as prompt leakage. That is too broad for ordinary prose
+	 * (for example, "critical warnings" or "mandatory revisions"). Keep the
+	 * field-level exception narrower than the full-article compatibility path:
+	 * only standalone ordinary-word signals are bypassed, and only when no
+	 * strong prompt marker or directive-like use is present.
 	 */
 	private static function is_field_assistant_false_positive( string $error_code, string $source, string $translated ): bool {
 		if ( 'invalid_translation_assistant_reply' !== $error_code ) {
@@ -1346,14 +1346,19 @@ final class SWQ_GLM52_Translation_Tuning {
 			return false;
 		}
 
-		if ( 1 === preg_match( '/\bcritical\s*:/iu', $translated )
-			|| 1 === preg_match( '/\bcritical\s+(?:output|instruction|instructions|rule|rules|translation|format|return|apply|keep|obey)\b/iu', $translated ) ) {
+		if ( 1 === preg_match( '/\b(?:critical|mandatory)\s*:/iu', $translated )
+			|| 1 === preg_match( '/\b(?:critical|mandatory)\s+(?:output|instruction|instructions|rule|rules|translation|format|return|apply|keep|obey)\b/iu', $translated )
+			|| 1 === preg_match( '/\breturn\s+only\b/iu', $translated ) ) {
 			return false;
 		}
 
 		$signals = self::broad_assistant_false_positive_signals( $source, $translated );
+		$ordinary_word_signals = [
+			'ordinary_critical_word',
+			'ordinary_mandatory_word',
+		];
 
-		return [ 'ordinary_critical_word' ] === $signals;
+		return ! empty( $signals ) && empty( array_diff( $signals, $ordinary_word_signals ) );
 	}
 
 	private static function wrap_field_error(
