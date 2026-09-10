@@ -149,13 +149,21 @@ $run = $protected['paragraph_runs'][0];
 $three_to_two = $run['start_token'] . "\n<p>A and B.</p>\n<p>C.</p>\n" . $run['stop_token'];
 para_check( true === validate_runs( $three_to_two, $protected['paragraph_runs'] ), 'three source paragraphs may become two target paragraphs' );
 
+$wrapper_source = protect( para( 'A' ) . para( 'B' ) );
+$wrapper_run = $wrapper_source['paragraph_runs'][0];
+foreach ( [ 'class' => '<p class="model">English A.</p>', 'style' => '<p style="color:red">English A.</p>' ] as $attribute => $paragraph ) {
+	$wrapper_payload = $wrapper_run['start_token'] . "\n" . $paragraph . "\n<p>English B.</p>\n" . $wrapper_run['stop_token'];
+	para_check( true === validate_runs( $wrapper_payload, $wrapper_source['paragraph_runs'] ), 'model ' . $attribute . ' paragraph wrapper is accepted as a non-structural wrapper' );
+	$wrapper_restored = restore_runs( $wrapper_payload, $wrapper_source['paragraph_runs'] );
+	para_check( ! str_contains( $wrapper_restored, '<p ' ) && 2 === substr_count( $wrapper_restored, '<!-- wp:paragraph -->' ), 'model ' . $attribute . ' paragraph wrapper attributes are discarded during standard restoration' );
+}
+
 foreach ( [
 	'zero paragraphs' => "\n",
 	'empty paragraph' => '<p></p>',
 	'whitespace-only paragraph' => '<p> &nbsp; </p>',
 	'punctuation-only paragraph' => '<p>.,:;()【】</p>',
 	'nested paragraph' => '<p>Outer <p>Inner</p></p>',
-	'paragraph attributes' => '<p class="x">A</p>',
 	'Gutenberg comment' => '<!-- wp:paragraph --><p>A</p><!-- /wp:paragraph -->',
 	'block-level heading' => '<h2>H</h2>',
 	'block-level list' => '<ul><li>A</li></ul>',
@@ -166,7 +174,6 @@ foreach ( [
 	$payload = $run['start_token'] . "\n" . $html . "\n" . $run['stop_token'];
 	para_check( is_wp_error( validate_runs( $payload, $protected['paragraph_runs'] ) ), $name . ' is rejected inside a run' );
 }
-
 foreach ( [
 	'missing START' => "<p>A</p>\n" . $run['stop_token'],
 	'missing STOP' => $run['start_token'] . "\n<p>A</p>",

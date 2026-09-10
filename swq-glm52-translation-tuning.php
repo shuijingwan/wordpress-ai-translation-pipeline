@@ -2188,7 +2188,7 @@ final class SWQ_GLM52_Translation_Tuning {
 		if ( preg_match( '~<\/?(?:h[1-6]|ul|ol|li|figure|blockquote|table|pre|img)\b~iu', $html ) ) {
 			return new WP_Error( 'swq_full_article_paragraph_run_block_element', 'A paragraph run contained a forbidden block-level element.' );
 		}
-		preg_match_all( '~<p>(.*?)</p>~su', $html, $matches, PREG_OFFSET_CAPTURE );
+		preg_match_all( '~<p(?:\s+[^<>]*)?>(.*?)</p\s*>~isu', $html, $matches, PREG_OFFSET_CAPTURE );
 		if ( empty( $matches[0] ) ) {
 			return new WP_Error( 'swq_full_article_paragraph_run_empty', 'A paragraph run did not contain a top-level paragraph.' );
 		}
@@ -2199,7 +2199,6 @@ final class SWQ_GLM52_Translation_Tuning {
 			if ( ! preg_match( '/^\s*$/u', substr( $html, $cursor, $offset - $cursor ) ) ) {
 				return new WP_Error( 'swq_full_article_paragraph_run_root_invalid', 'A paragraph run contained non-paragraph root content.' );
 			}
-			$paragraph = (string) $match[0];
 			$inner = (string) $matches[1][ $index ][0];
 			if ( preg_match( '~<\/?p\b~iu', $inner ) ) {
 				return new WP_Error( 'swq_full_article_paragraph_run_nested_paragraph', 'A paragraph run contained a nested paragraph.' );
@@ -2211,8 +2210,8 @@ final class SWQ_GLM52_Translation_Tuning {
 			if ( 1 === preg_match( '/^[\p{P}\p{Z}\s]+$/u', $plain ) ) {
 				return new WP_Error( 'swq_full_article_paragraph_run_punctuation_only', 'A paragraph run contained a punctuation-only paragraph.' );
 			}
-			$paragraphs[] = $paragraph;
-			$cursor = $offset + strlen( $paragraph );
+			$paragraphs[] = '<p>' . $inner . '</p>';
+			$cursor = $offset + strlen( (string) $match[0] );
 		}
 		if ( ! preg_match( '/^\s*$/u', substr( $html, $cursor ) ) ) {
 			return new WP_Error( 'swq_full_article_paragraph_run_root_invalid', 'A paragraph run contained non-paragraph trailing content.' );
