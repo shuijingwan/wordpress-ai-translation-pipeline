@@ -35,7 +35,7 @@ $expected = [ $a, $b, $c ];
 $source = $a . "\n" . $b . "\n" . $c;
 $map = [ $b => '<code>curl</code>' ];
 
-check( count( $GLOBALS['filters'] ) === 3, 'MU Plugin boot registers all filters' );
+check( count( $GLOBALS['filters'] ) === 4, 'MU Plugin boot registers all filters' );
 check( true === invoke_private( 'validate_protected_tokens', $source, $expected, $source, $map, $source ), 'valid count, uniqueness, and order' );
 
 $recoverable = $a . "\n" . $c;
@@ -70,9 +70,9 @@ check( is_array( $protected ) && 3 === count( $protected['map'] ), 'content prot
 $restored = str_replace( array_keys( $protected['map'] ), array_values( $protected['map'] ), $protected['payload'] );
 check( $sample === $restored, 'protected content restores byte-for-byte' );
 
-$diagnostic = json_decode( (string) file_get_contents( '/tmp/swq-glm52-token-validation-summary.json' ), true );
+$diagnostic = json_decode( (string) file_get_contents( '/tmp/swq-glm53-token-validation-summary.json' ), true );
 $required = [ 'expected_count', 'actual_count', 'missing_tokens', 'extra_tokens', 'fixed_order', 'first_mismatch_index', 'previous_expected_token', 'next_expected_token', 'raw_response_file', 'diagnostic_file', 'source_context', 'response_context' ];
 check( [] === array_diff( $required, array_keys( $diagnostic ) ), 'diagnostic JSON contains all required fields' );
-check( 0600 === ( fileperms( '/tmp/swq-glm52-token-validation-summary.json' ) & 0777 ), 'diagnostic permissions are 0600' );
+check( 0600 === ( fileperms( '/tmp/swq-glm53-token-validation-summary.json' ) & 0777 ), 'diagnostic permissions are 0600' );
 
 echo "ALL TESTS PASSED\n";

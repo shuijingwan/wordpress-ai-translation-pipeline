@@ -1,8 +1,8 @@
 <?php
 /**
- * Plugin Name: SWQ GLM-5.2 Translation Tuning
- * Description: Tunes GLM-5.2 requests and enables one-shot full-article translation for SlyTranslate with language-aware prompts, safe Plaintext translation, protected structures, and exact post-content persistence.
- * Version: 2026.07.30.19
+ * Plugin Name: SWQ GLM-5.3 Translation Tuning
+ * Description: Tunes GLM-5.3 requests and enables one-shot full-article translation for SlyTranslate with language-aware prompts, safe Plaintext translation, protected structures, and exact post-content persistence.
+ * Version: 2026.11.11.1
  */
 
 defined( 'ABSPATH' ) || exit;
@@ -10,12 +10,12 @@ defined( 'ABSPATH' ) || exit;
 final class SWQ_GLM52_Translation_Tuning {
 
 	private const REST_ROUTE = '/ai-translate/v1/ai-translate/translate-content/run';
-	private const MODEL_MARKER = 'glm-5.2';
-	private const NORMAL_MIN_OUTPUT_TOKENS = 1024;
-	private const FULL_ARTICLE_MAX_OUTPUT_TOKENS = 32768;
+	private const MODEL_MARKER = 'glm-5.3';
+	private const NORMAL_MIN_OUTPUT_TOKENS = 65536;
+	private const FULL_ARTICLE_MAX_OUTPUT_TOKENS = 131072;
 	private const FULL_ARTICLE_TIMEOUT = 600;
 	private const FULL_ARTICLE_RUNAWAY_OUTPUT_RATIO = 6.0;
-	private const TRACE_FILE = '/tmp/swq-glm52-execution-trace.jsonl';
+	private const TRACE_FILE = '/tmp/swq-glm53-execution-trace.jsonl';
 	private const PROMPT_POLICY_VERSION = '2026-07-30-v13';
 	private const TRANSLATION_TAIL_GUARD = 'SWQTRANSLATIONTAILGUARDEND';
 	private const PROTECTED_TOKEN_REGEX = '/SWQ(?:BLOCK|INLINE|HTML|STRUCT|PARARUNSTART|PARARUNSTOP|PLAINSTART|PLAINSTOP|ALTSTART|ALTSTOP)\d{6}END/';
@@ -33,6 +33,8 @@ final class SWQ_GLM52_Translation_Tuning {
 
 	public static function boot(): void {
 		add_filter( 'http_request_args', [ self::class, 'tune_glm52_request' ], PHP_INT_MAX - 10, 2 );
+		// Run before SlyTranslate's priority-1 reasoning-only content promotion.
+		add_filter( 'http_response', [ self::class, 'guard_glm53_response' ], 0, 3 );
 		add_filter( 'pre_http_request', [ self::class, 'guard_full_article_request' ], PHP_INT_MAX, 3 );
 		add_filter( 'rest_dispatch_request', [ self::class, 'intercept_translate_content' ], PHP_INT_MAX, 4 );
 	}
@@ -48,7 +50,7 @@ final class SWQ_GLM52_Translation_Tuning {
 		}
 
 		$model = strtolower( trim( (string) ( $body['model'] ?? '' ) ) );
-		if ( ! str_contains( $model, self::MODEL_MARKER ) ) {
+		if ( ! self::is_glm53_model( $model ) ) {
 			return $args;
 		}
 
@@ -63,18 +65,25 @@ final class SWQ_GLM52_Translation_Tuning {
 			]
 		);
 
-		$body['thinking'] = [ 'type' => 'disabled' ];
+		// GLM-5.3 always thinks; remove legacy template overrides on every request.
+		$body['thinking'] = [ 'type' => 'enabled' ];
+		$body['reasoning_effort'] = 'high';
+		$body['stream'] = false;
+		unset( $body['chat_template_kwargs'] );
+		// The Chat Completions API explicitly supports greedy sampling for translation.
 		$body['do_sample'] = false;
 		$current_max_tokens = isset( $body['max_tokens'] ) ? (int) $body['max_tokens'] : 0;
 
 		if ( self::$state['active'] ) {
 			$body['max_tokens'] = self::FULL_ARTICLE_MAX_OUTPUT_TOKENS;
-			unset( $body['chat_template_kwargs'] );
-			$args['timeout'] = max( (int) ( $args['timeout'] ?? 0 ), self::FULL_ARTICLE_TIMEOUT );
 			self::$state['max_tokens'] = self::FULL_ARTICLE_MAX_OUTPUT_TOKENS;
-		} elseif ( $current_max_tokens < self::NORMAL_MIN_OUTPUT_TOKENS ) {
-			$body['max_tokens'] = self::NORMAL_MIN_OUTPUT_TOKENS;
+		} else {
+			// Thinking and final text share the output budget; use the documented
+			// 64K default for fields and the 128K maximum for whole articles.
+			$body['max_tokens'] = min( self::FULL_ARTICLE_MAX_OUTPUT_TOKENS, max( self::NORMAL_MIN_OUTPUT_TOKENS, $current_max_tokens ) );
 		}
+		// HTTP client timeout (seconds), not a model request-body parameter.
+		$args['timeout'] = max( (int) ( $args['timeout'] ?? 0 ), self::FULL_ARTICLE_TIMEOUT );
 
 		$encoded = wp_json_encode( $body, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES );
 		if ( is_string( $encoded ) ) {
@@ -94,6 +103,63 @@ final class SWQ_GLM52_Translation_Tuning {
 
 
 		return $args;
+	}
+
+	/**
+	 * Reject incomplete answers before any runtime can promote reasoning_content
+	 * to article text. Only a completed final answer may reach existing validators.
+	 */
+	public static function guard_glm53_response( $response, array $parsed_args, string $url ) {
+		if ( ! is_array( $response )
+			|| ! self::is_zhipu_chat_endpoint( $url )
+			|| 'POST' !== strtoupper( (string) ( $parsed_args['method'] ?? 'GET' ) ) ) {
+			return $response;
+		}
+
+		$request_body = self::decode_request_body( $parsed_args['body'] ?? '' );
+		if ( ! self::is_glm53_model( (string) ( $request_body['model'] ?? '' ) ) ) {
+			return $response;
+		}
+
+		$status = (int) ( $response['response']['code'] ?? 0 );
+		if ( $status < 200 || $status >= 300 ) {
+			return $response;
+		}
+
+		$decoded = self::decode_request_body( $response['body'] ?? '' );
+		$choice = $decoded['choices'][0] ?? null;
+		if ( ! is_array( $choice ) ) {
+			return new WP_Error( 'swq_glm53_response_invalid', 'GLM-5.3 returned no valid completion choice.' );
+		}
+
+		$finish_reason = $choice['finish_reason'] ?? null;
+		$completion_tokens = (int) ( $decoded['usage']['completion_tokens'] ?? 0 );
+		$max_tokens = (int) ( $request_body['max_tokens'] ?? 0 );
+		self::trace_event(
+			'glm53_response_checked',
+			[
+				'finish_reason'     => $finish_reason,
+				'completion_tokens' => $completion_tokens,
+				'max_tokens'        => $max_tokens,
+			]
+		);
+
+		if ( 'length' === $finish_reason || ( $max_tokens > 0 && $completion_tokens >= $max_tokens ) ) {
+			return new WP_Error(
+				'swq_glm53_output_truncated',
+				'GLM-5.3 exhausted the shared thinking/final-answer output budget. Translation was rejected; no partial result may be saved.'
+			);
+		}
+		if ( 'stop' !== $finish_reason ) {
+			return new WP_Error( 'swq_glm53_response_incomplete', 'GLM-5.3 did not finish with stop. Translation was rejected as incomplete.' );
+		}
+
+		$content = $choice['message']['content'] ?? null;
+		if ( ! is_string( $content ) || '' === trim( $content ) ) {
+			return new WP_Error( 'swq_glm53_final_content_missing', 'GLM-5.3 returned no final answer. Thinking content cannot be used as a translation.' );
+		}
+
+		return $response;
 	}
 
 	public static function guard_full_article_request( $preempt, array $parsed_args, string $url ) {
@@ -131,11 +197,11 @@ final class SWQ_GLM52_Translation_Tuning {
 		$model = strtolower( trim( (string) ( $body['model'] ?? '' ) ) );
 		self::$state['request_model'] = $model;
 
-		if ( ! str_contains( $model, self::MODEL_MARKER ) ) {
+		if ( ! self::is_glm53_model( $model ) ) {
 			return new WP_Error(
 				'swq_full_article_request_model_mismatch',
 				sprintf(
-					'Full-article translation requires GLM-5.2, but the actual request used "%s".',
+					'Full-article translation requires GLM-5.3, but the actual request used "%s".',
 					'' !== $model ? $model : 'unknown'
 				)
 			);
@@ -202,8 +268,8 @@ final class SWQ_GLM52_Translation_Tuning {
 			]
 		);
 
-		if ( '' === $model_slug || ! str_contains( strtolower( $model_slug ), self::MODEL_MARKER ) ) {
-			self::trace_event( 'rest_bypassed', [ 'reason' => 'model_slug_not_glm52' ] );
+		if ( ! self::is_glm53_model( $model_slug ) ) {
+			self::trace_event( 'rest_bypassed', [ 'reason' => 'model_slug_not_glm53' ] );
 			return $dispatch_result;
 		}
 
@@ -1369,7 +1435,7 @@ final class SWQ_GLM52_Translation_Tuning {
 		string $source,
 		string $translated
 	): WP_Error {
-		$summary_file = '/tmp/swq-glm52-field-error-summary.json';
+		$summary_file = '/tmp/swq-glm53-field-error-summary.json';
 		$summary = [
 			'post_id'          => $post_id,
 			'field'            => $field,
@@ -1452,7 +1518,7 @@ final class SWQ_GLM52_Translation_Tuning {
 
 		error_log(
 			sprintf(
-				'[SWQ GLM-5.2 Full Article] start post_id=%d payload_chars=%d protected_tokens=%d',
+				'[SWQ GLM-5.3 Full Article] start post_id=%d payload_chars=%d protected_tokens=%d',
 				$post_id,
 				self::$state['payload_chars'],
 				self::$state['protected_count']
@@ -1493,7 +1559,7 @@ final class SWQ_GLM52_Translation_Tuning {
 		if ( is_wp_error( $result ) ) {
 			error_log(
 				sprintf(
-					'[SWQ GLM-5.2 Full Article] failed post_id=%d requests=%d model=%s error=%s',
+					'[SWQ GLM-5.3 Full Article] failed post_id=%d requests=%d model=%s error=%s',
 					$post_id,
 					$state['request_count'],
 					$state['request_model'],
@@ -1641,7 +1707,7 @@ final class SWQ_GLM52_Translation_Tuning {
 
 		error_log(
 			sprintf(
-				'[SWQ GLM-5.2 Full Article] success post_id=%d requests=%d model=%s max_tokens=%d source_chars=%d payload_chars=%d output_chars=%d protected_tokens=%d chunk_fallback=disabled',
+				'[SWQ GLM-5.3 Full Article] success post_id=%d requests=%d model=%s max_tokens=%d source_chars=%d payload_chars=%d output_chars=%d protected_tokens=%d chunk_fallback=disabled',
 				$post_id,
 				$state['request_count'],
 				$state['request_model'],
@@ -2742,8 +2808,8 @@ final class SWQ_GLM52_Translation_Tuning {
 				return true;
 			}
 
-			$summary_file  = '/tmp/swq-glm52-runaway-summary.json';
-			$output_file   = '/tmp/swq-glm52-runaway-output.txt';
+			$summary_file  = '/tmp/swq-glm53-runaway-summary.json';
+			$output_file   = '/tmp/swq-glm53-runaway-output.txt';
 			$ratio         = round( $translated_length / $source_length, 4 );
 			$source_blocks = self::block_signature( $source );
 			$output_blocks = self::block_signature( $translated );
@@ -2795,8 +2861,8 @@ final class SWQ_GLM52_Translation_Tuning {
 		if ( 'invalid_translation_assistant_reply' === $error_code ) {
 			$strong_markers = self::strong_prompt_leakage_markers( $source, $translated );
 
-			$summary_file = '/tmp/swq-glm52-assistant-validation-summary.json';
-			$output_file  = '/tmp/swq-glm52-assistant-validation-output.txt';
+			$summary_file = '/tmp/swq-glm53-assistant-validation-summary.json';
+			$output_file  = '/tmp/swq-glm53-assistant-validation-output.txt';
 			$summary = [
 				'post_id'                 => (int) ( self::$state['post_id'] ?? 0 ),
 				'target_language'         => $target_language,
@@ -2839,8 +2905,8 @@ final class SWQ_GLM52_Translation_Tuning {
 			);
 		}
 
-		$summary_file = '/tmp/swq-glm52-validation-summary.json';
-		$output_file  = '/tmp/swq-glm52-validation-output.txt';
+		$summary_file = '/tmp/swq-glm53-validation-summary.json';
+		$output_file  = '/tmp/swq-glm53-validation-output.txt';
 		$summary = [
 			'post_id'                => (int) ( self::$state['post_id'] ?? 0 ),
 			'target_language'        => $target_language,
@@ -3258,7 +3324,7 @@ final class SWQ_GLM52_Translation_Tuning {
 		self::trace_event( 'translation_tail_guard', $log_data );
 		error_log(
 			sprintf(
-				'[SWQ GLM-5.2 Full Article] translation_tail_guard_expected=%s translation_tail_guard_status=%s translation_tail_guard_count=%d',
+				'[SWQ GLM-5.3 Full Article] translation_tail_guard_expected=%s translation_tail_guard_status=%s translation_tail_guard_count=%d',
 				$log_data['translation_tail_guard_expected'] ? 'true' : 'false',
 				$log_data['translation_tail_guard_status'],
 				$log_data['translation_tail_guard_count']
@@ -3356,7 +3422,7 @@ final class SWQ_GLM52_Translation_Tuning {
 
 		self::trace_event( 'protected_token_tail_repair', $diagnostic );
 		error_log(
-			'[SWQ GLM-5.2 Full Article] '
+			'[SWQ GLM-5.3 Full Article] '
 			. implode(
 				' ',
 				array_map(
@@ -3491,8 +3557,8 @@ final class SWQ_GLM52_Translation_Tuning {
 			'response_context'                 => $response_context,
 		];
 
-		$summary_file = '/tmp/swq-glm52-token-validation-summary.json';
-		$output_file  = '/tmp/swq-glm52-token-validation-output.txt';
+		$summary_file = '/tmp/swq-glm53-token-validation-summary.json';
+		$output_file  = '/tmp/swq-glm53-token-validation-output.txt';
 		$summary['raw_response_file'] = $output_file;
 		$summary['diagnostic_file']   = $summary_file;
 		$summary_json = wp_json_encode( $summary, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES | JSON_PRETTY_PRINT );
@@ -3693,7 +3759,7 @@ final class SWQ_GLM52_Translation_Tuning {
 
 	private static function gutenberg_structure_drift_diagnostic_paths( int $post_id ): array {
 		$safe_post_id = max( 0, $post_id );
-		$prefix       = sprintf( '/tmp/swq-glm52-gutenberg-structure-drift-%d', $safe_post_id );
+		$prefix       = sprintf( '/tmp/swq-glm53-gutenberg-structure-drift-%d', $safe_post_id );
 
 		return [
 			'summary'  => $prefix . '-summary.json',
@@ -3954,6 +4020,10 @@ PROMPT;
 		}
 		$body = json_decode( $raw_body, true );
 		return is_array( $body ) ? $body : [];
+	}
+
+	private static function is_glm53_model( string $model ): bool {
+		return self::MODEL_MARKER === strtolower( trim( $model ) );
 	}
 
 	private static function is_zhipu_chat_endpoint( string $url ): bool {

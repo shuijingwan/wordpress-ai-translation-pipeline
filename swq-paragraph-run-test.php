@@ -81,8 +81,8 @@ function protect( string $content ): array { return para_invoke( 'protect_conten
 function validate_runs( string $payload, array $runs ) { return para_invoke( 'validate_paragraph_runs', $payload, $runs ); }
 function restore_runs( string $payload, array $runs ) { return para_invoke( 'restore_paragraph_runs', $payload, $runs ); }
 
-@unlink( '/tmp/swq-glm52-gutenberg-structure-drift-summary.json' );
-@unlink( '/tmp/swq-glm52-gutenberg-structure-drift-restored.txt' );
+@unlink( '/tmp/swq-glm53-gutenberg-structure-drift-summary.json' );
+@unlink( '/tmp/swq-glm53-gutenberg-structure-drift-restored.txt' );
 
 $source = para( 'A' ) . para( 'B' ) . block( 'heading', '<h2>H</h2>' ) . para( 'C' ) . para( 'D' );
 $protected = protect( $source );
@@ -238,7 +238,7 @@ para_check( 3 === count( para_invoke( 'paragraph_run_block_signature', $quote_si
 
 $same_signature = para_invoke( 'paragraph_run_block_signature', $signature_source );
 para_check( $same_signature === para_invoke( 'paragraph_run_block_signature', $signature_source ), 'matching normalized signatures do not drift' );
-para_check( ! file_exists( '/tmp/swq-glm52-gutenberg-structure-drift-summary.json' ) && ! file_exists( '/tmp/swq-glm52-gutenberg-structure-drift-restored.txt' ), 'matching signatures do not create drift diagnostics' );
+para_check( ! file_exists( '/tmp/swq-glm53-gutenberg-structure-drift-summary.json' ) && ! file_exists( '/tmp/swq-glm53-gutenberg-structure-drift-restored.txt' ), 'matching signatures do not create drift diagnostics' );
 
 $drift_source = para( 'A' ) . block( 'heading', '<h2>H</h2>' ) . block( 'quote', '<blockquote><p>Q</p></blockquote>' ) . para( 'B' );
 $drift_restored = para( 'A' ) . block( 'quote', '<blockquote><p>Q</p></blockquote>' ) . para( 'B' );
@@ -276,8 +276,8 @@ para_check( 0600 === ( fileperms( $candidate_file ) & 0777 ) && 0600 === ( filep
 $post_5050_paths = para_invoke( 'gutenberg_structure_drift_diagnostic_paths', 5050 );
 $post_5079_paths = para_invoke( 'gutenberg_structure_drift_diagnostic_paths', 5079 );
 para_check(
-	'/tmp/swq-glm52-gutenberg-structure-drift-5050-summary.json' === $post_5050_paths['summary']
-		&& '/tmp/swq-glm52-gutenberg-structure-drift-5050-restored.txt' === $post_5050_paths['restored'],
+	'/tmp/swq-glm53-gutenberg-structure-drift-5050-summary.json' === $post_5050_paths['summary']
+		&& '/tmp/swq-glm53-gutenberg-structure-drift-5050-restored.txt' === $post_5050_paths['restored'],
 	'Gutenberg structure drift diagnostics include the post ID'
 );
 para_check( $post_5050_paths !== $post_5079_paths, 'different posts cannot overwrite each other structure drift diagnostics' );

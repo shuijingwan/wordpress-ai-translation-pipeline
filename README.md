@@ -31,7 +31,7 @@
 
 ## 仓库结构
 
-- `swq-glm52-translation-tuning.php`：当前站点专用的 MU Plugin 调优实现。
+- `swq-glm52-translation-tuning.php`：当前维护及后续部署取件来源，运行逻辑仅支持 GLM-5.3；保留原部署文件名和历史类名，避免重复加载 MU Plugin。
 - `sources/`：分析和复现所需的源码快照；其中可能包含安装态第三方插件源码。
 - `patch/`：测试、补丁、候选实现和验证工具。
 - `archive/`：历史候选或未发布方案，不代表当前生产版本。
@@ -40,13 +40,18 @@
 
 这些目录并不都是可直接安装的正式产品。部署或复用前应确认权威文件、版本和适用范围。
 
+GLM-5.3 迁移的来源核对、参数依据及离线验证说明见 [本地迁移记录](analysis/glm53-migration-local.md)。`sources/mu-plugins/swq-glm52-translation-tuning.php` 保留为历史 GLM-5.2 快照，不作为 GLM-5.3 部署文件。
+
 ## 测试
 
 特色图片媒体附件与 alt 同步相关测试可通过以下命令运行：
 
 ```bash
-bash patch/run-featured-image-tests.sh
+php patch/featured-image-media-sync-tests.php
+php patch/featured-image-sync-tests.php
 ```
+
+旧 `patch/run-featured-image-tests.sh` 要求维护文件与历史快照 SHA 相同；两份文件已独立演进，当前直接运行上述 PHP 测试。
 
 Plaintext 区块完整性、受保护 Token 和相邻 Token 修复测试可通过以下命令运行：
 
@@ -56,9 +61,14 @@ php swq-token-validation-test.php
 php swq-adjacent-token-repair-test.php
 php swq-tail-struct-token-repair-test.php
 php patch/token-normalization-tests.php
+php swq-paragraph-run-test.php
+php swq-field-assistant-validation-test.php
+php swq-glm53-migration-test.php
+php swq-glm53-migration-test.php --workflow
 ```
 
 测试使用轻量 mock/stub 验证站点专用逻辑，不能替代与目标 WordPress、Polylang 和 SlyTranslate 版本一致的集成测试。
+Plaintext 历史测试仍覆盖 `sources/` 快照；GLM-5.3 迁移测试另行覆盖当前维护版本的 Plaintext 请求与还原行为。
 
 ## 安全说明
 

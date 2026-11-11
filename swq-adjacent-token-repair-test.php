@@ -6,7 +6,7 @@ define( 'ABSPATH', __DIR__ . '/' );
 
 function add_filter( ...$args ): void {}
 
-require __DIR__ . '/sources/mu-plugins/swq-glm52-translation-tuning.php';
+require __DIR__ . '/swq-glm52-translation-tuning.php';
 
 function invoke_token_method( string $method, ...$args ) {
 	$reflection = new ReflectionMethod( 'SWQ_GLM52_Translation_Tuning', $method );
